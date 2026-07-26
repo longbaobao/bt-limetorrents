@@ -1,9 +1,9 @@
-"""crawl_1337x_by_key.py 重构后的签名测试。
+"""LimeTorrents 列表爬虫重构后的签名冒烟测试。
 
 重构后:
-- main(keyword, page, coll, started_at) 单次尝试,4 参
-- run_with_retry(keyword) 共享 Chrome 自重启重试
-- __main__ 调 run_with_retry(),不再调 main()
+- main(argv) 接收 argparse argv,自启 Chrome,并负责 quit()
+- parse_args(argv) 双模式参数(浏览 / 关键词),分类与搜索分类分开
+- parse_listing(html, *, mode, category, keyword) 解析 table.table2
 
 直接跑:python test_signature.py
 """
@@ -25,43 +25,59 @@ def check(cond, msg):
 
 
 def main():
-    # 1. main() 签名: 4 个参数 (keyword, page, coll, started_at)
+    # 1. main/parse_args/parse_listing 都存在且 callable
+    check(callable(ck.main), "main 可调用")
+    check(callable(ck.parse_args), "parse_args 可调用")
+    check(callable(ck.parse_listing), "parse_listing 可调用")
+
+    # 2. main 签名: 1 个参数 argv
     sig = inspect.signature(ck.main)
     params = list(sig.parameters.keys())
-    check(params == ["keyword", "page", "coll", "started_at"],
-          f"main() 4 参签名: {params}")
+    check(params == ["argv"], f"main(argv) 单参签名: {params}")
 
-    # 2. run_with_retry() 签名: 1 个参数 (keyword)
-    sig = inspect.signature(ck.run_with_retry)
+    # 3. parse_args 签名: 1 个参数 argv
+    sig = inspect.signature(ck.parse_args)
     params = list(sig.parameters.keys())
-    check(params == ["keyword"],
-          f"run_with_retry() 1 参签名: {params}")
+    check(params == ["argv"], f"parse_args(argv) 单参签名: {params}")
 
-    # 3. 重试常量都在
-    check(hasattr(ck, "MAX_ATTEMPTS") and ck.MAX_ATTEMPTS == 4,
-          f"MAX_ATTEMPTS={ck.MAX_ATTEMPTS} (=4)")
-    check(hasattr(ck, "RETRY_BACKOFF") and ck.RETRY_BACKOFF == 5,
-          f"RETRY_BACKOFF={ck.RETRY_BACKOFF} (=5)")
+    # 4. parse_listing 签名: html + mode/category/keyword 等 keyword-only
+    sig = inspect.signature(ck.parse_listing)
+    params = list(sig.parameters.keys())
+    check(
+        params == ["html", "mode", "category", "keyword", "ref_now"],
+        f"parse_listing 关键字参数: {params}",
+    )
 
-    # 4. main() 不再自己创建 Chrome (没有 auto_port / set_argument 调用)
+    # 5. main() 自启 Chrome,finally 调 quit(),不再依赖外部 page
     src = inspect.getsource(ck.main)
-    check("auto_port" not in src, "main() 不调用 auto_port (Chrome 归 run_with_retry 管)")
-    check("ChromiumPage(" not in src, "main() 不创建 ChromiumPage")
+    check("ChromiumPage(" in src, "main() 创建 ChromiumPage(自启 Chrome)")
+    check("browser.quit()" in src, "main() 在 finally 调 browser.quit()")
+    check("auto_port(True)" in src, "main() 用 auto_port 启独立 Chrome")
 
-    # 5. run_with_retry() 创建并管理 Chrome
-    src = inspect.getsource(ck.run_with_retry)
-    check("auto_port" in src, "run_with_retry() 调 auto_port")
-    check("ChromiumPage(" in src, "run_with_retry() 创建 ChromiumPage")
-    check("page.quit()" in src, "run_with_retry() 负责 quit()")
+    # 6. checkpoint 三个函数都是新的 3 参签名
+    sig = inspect.signature(ck.load_checkpoint)
+    params = list(sig.parameters.keys())
+    check(
+        params == ["mode", "category", "keyword"],
+        f"load_checkpoint(mode, category, keyword): {params}",
+    )
+    sig = inspect.signature(ck.clear_checkpoint)
+    params = list(sig.parameters.keys())
+    check(
+        params == ["mode", "category", "keyword"],
+        f"clear_checkpoint(mode, category, keyword): {params}",
+    )
+    sig = inspect.signature(ck.save_checkpoint)
+    params = list(sig.parameters.keys())
+    check(params == ["state"], f"save_checkpoint(state) 单参: {params}")
 
-    # 6. main() 不再含 page.quit (Chrome 不归 main 管)
-    src = inspect.getsource(ck.main)
-    check("page.quit()" not in src, "main() 不再调 page.quit()")
-
-    # 7. main() 用 None 当 page 会优雅降级(fetch_with_cf_bypass 内部超时后返回 2),
-    #    不抛异常给 run_with_retry 增加处理负担
-    rc = ck.main("nosuchkey", None, None, 0.0)
-    check(rc == 2, f"main() page=None → rc=2 优雅返回(不抛异常): 实际 rc={rc}")
+    # 7. upsert_listing 已是幂等接口
+    sig = inspect.signature(ck.upsert_listing)
+    params = list(sig.parameters.keys())
+    check(
+        params == ["coll", "item"],
+        f"upsert_listing(coll, item): {params}",
+    )
 
     print()
     if failures:

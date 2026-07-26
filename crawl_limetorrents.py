@@ -1,8 +1,10 @@
 """
-1337x 搜索结果抓取：单个关键词全量翻页，落 MongoDB。
+LimeTorrents 列表与关键词爬虫：分类浏览或单关键词搜索，分页翻页、checkpoint
+续跑、列表解析、幂等 upsert。DrissionPage 拉自己的 Chrome,每个子脚本独立管理
+浏览器生命周期。
 
-DrissionPage 拉自己的 Chrome,每个子脚本独立管理浏览器生命周期。
-keyword 通过命令行参数传入，方便被 crawl_1337x_by_keys.py 并发调用。
+成功加载且含真实结果表(table.table2)后再推进 checkpoint；失败页不写
+checkpoint,以免 wrapper 重试时丢失中间进度。
 
 Headless 模式：DrissionPage 4.1.1.4 的 .headless(True) 在 Windows 上有 bug
 (传 --headless=new,Chrome 不监听 ws endpoint,DrissionPage 连不上报 404)。
@@ -13,7 +15,6 @@ import sys
 sys.stdout.reconfigure(encoding="utf-8")
 import argparse
 import json
-import os
 import re
 import time
 import hashlib
@@ -145,53 +146,98 @@ PAGE_SLEEP = 1.0
 MAX_ATTEMPTS = 4
 RETRY_BACKOFF = 5  # 每次尝试前 sleep 秒数
 
-# 断点续爬 checkpoint 目录:每个 keyword 一个 JSON,记录已爬到的页码。
+# 断点续爬 checkpoint 目录:每个 (mode, category, keyword) 一个 JSON。
 # 子进程被 wrapper 超时 kill 后,重试可从中断页继续,而不是重头爬(避免大 key 永远超时无进展)。
 CHECKPOINT_DIR = Path("data/checkpoints")
 
 
-def _checkpoint_path(keyword: str) -> Path:
-    """keyword → checkpoint 文件路径。文件名做安全化 + md5 后缀防冲突/防非法字符。"""
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", keyword)[:40]
-    h = hashlib.md5(keyword.encode()).hexdigest()[:8]
-    return CHECKPOINT_DIR / f"{safe}-{h}.json"
+def _query_key(mode: str, category: str, keyword: str | None) -> str:
+    return f"{mode}|{category}|{keyword or ''}"
 
 
-def load_checkpoint(keyword: str) -> tuple[int, int]:
-    """读取 (done_page, last_page)。无 checkpoint 或读取失败返回 (0, 0)。"""
-    p = _checkpoint_path(keyword)
-    if not p.exists():
-        return 0, 0
+def checkpoint_path(mode: str, category: str, keyword: str | None) -> Path:
+    """(mode, category, keyword) → checkpoint 文件路径, md5 摘要防冲突 / 防非法字符。"""
+    digest = hashlib.md5(_query_key(mode, category, keyword).encode("utf-8")).hexdigest()
+    return CHECKPOINT_DIR / f"limetorrents-{digest}.json"
+
+
+def load_checkpoint(mode: str, category: str, keyword: str | None) -> dict | None:
+    """读取 checkpoint。无 checkpoint 返回 None。"""
+    path = checkpoint_path(mode, category, keyword)
+    if not path.exists():
+        return None
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        return int(data.get("done_page", 0)), int(data.get("last_page", 0))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
-        logger.warning(f"读取 checkpoint 失败({p.name}): {e}，当作无 checkpoint 从头开始")
-        return 0, 0
+        logger.warning(f"读取 checkpoint 失败({path.name}): {e}，当作无 checkpoint 从头开始")
+        return None
 
 
-def save_checkpoint(keyword: str, done_page: int, last_page: int) -> None:
-    """原子写 checkpoint(先写 .tmp 再 replace),防止子进程被 kill 时留下半截损坏文件。"""
+def save_checkpoint(state: dict) -> None:
+    """原子写 checkpoint(先写 .tmp 再 replace),防止子进程被 kill 时留下半截损坏文件。
+
+    state 必须包含 query_type/category/keyword(决定文件名);current_page/next_url/
+    updated_at 是主流程需要读回的字段。
+    """
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    p = _checkpoint_path(keyword)
-    tmp = p.parent / (p.name + ".tmp")
-    payload = {
-        "keyword": keyword,
-        "done_page": done_page,
-        "last_page": last_page,
-        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(p)  # 同盘原子替换
+    path = checkpoint_path(
+        state["query_type"],
+        state["category"],
+        state.get("keyword"),
+    )
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)  # 同盘原子替换
 
 
-def clear_checkpoint(keyword: str) -> None:
+def clear_checkpoint(mode: str, category: str, keyword: str | None) -> None:
     """全部爬完后删除 checkpoint。"""
-    p = _checkpoint_path(keyword)
-    try:
-        p.unlink(missing_ok=True)
-    except Exception as e:
-        logger.warning(f"删除 checkpoint 失败({p.name}): {e}")
+    checkpoint_path(mode, category, keyword).unlink(missing_ok=True)
+
+
+def upsert_listing(coll, item: dict) -> bool:
+    """将列表抓取的结果幂等写入 MongoDB。
+
+    - $set 覆盖 name/torrent_url/category/added/size/seeders/leechers/source/last_seen_at
+      (用最新观察值刷新列表字段)。
+    - $setOnInsert 设定首次见到时的 first_seen_at + detail_status=pending +
+      状态字段(避免覆盖已 processing/done/failed 的记录)。
+    - $addToSet 累积 keywords 和 discovery_modes(同一 detail 可能被多 key/多 mode 发现)。
+
+    返回 True 表示本次为 insert, False 表示命中已有记录。
+    """
+    stored = {
+        key: value
+        for key, value in item.items()
+        if key not in {"keyword", "discovery_mode", "observed_at"}
+    }
+    stored["last_seen_at"] = item["observed_at"]
+    set_on_insert = {
+        "first_seen_at": item["observed_at"],
+        "detail_status": "pending",
+        "detail_started_at": None,
+        "detail_processed_at": None,
+        "detail_error": None,
+    }
+    add_to_set = {"discovery_modes": item["discovery_mode"]}
+    if item.get("keyword"):
+        add_to_set["keywords"] = item["keyword"]
+    else:
+        set_on_insert["keywords"] = []
+
+    result = coll.update_one(
+        {"_id": item["_id"]},
+        {
+            "$set": stored,
+            "$setOnInsert": set_on_insert,
+            "$addToSet": add_to_set,
+        },
+        upsert=True,
+    )
+    return result.upserted_id is not None
 
 # 1337x 时间格式: "Oct. 21st '22" / "2am Jul. 13th" / "Jul. 29th '24"
 MONTH_MAP = {
@@ -381,12 +427,11 @@ def load_page_with_retry(tab, url: str, page_num: int, retries: int = 3) -> str 
 
     Cloudflare 5秒盾由 fetch_with_cf_bypass 内置处理 (见下), 无需手动 retry。
 
-    注意 target_selector 用 "table.table-list tbody tr"(要求至少一行结果),
-    而不是 "table.table-list"(只要表格骨架)。否则 CF 软墙/未渲染返回的空表格
-    会被当成"加载成功",导致 detect_last_page=1、解析 0 条、误判爬完写入 done。
+    目标选择器 "css:table.table2" — 只看结果表(LimeTorrents 列表),不看 Sponsored。
+    没有结果表骨架(CF 软墙/未渲染)由 has_result_table() 在外层判失败。
     """
     try:
-        return fetch_with_cf_bypass(tab, url, "table.table-list tbody tr", max_wait=45)
+        return fetch_with_cf_bypass(tab, url, "css:table.table2", max_wait=45)
     except Exception as e:
         logger.warning(f"第 {page_num} 页加载失败: {type(e).__name__}: {str(e)[:80]}")
         return None
@@ -471,137 +516,161 @@ def fetch_with_cf_bypass(tab, url: str, target_selector: str, max_wait: int = 45
     )
 
 
-def main(keyword: str, page, coll, started_at: float) -> int:
-    """抓取单个 keyword 全量翻页(单次尝试)。
-    Chrome 由调用方 run_with_retry 创建/关闭;本函数只负责翻页+checkpoint+落库。
-    返回 0=全部爬完,非 0=失败(交给外层重试)。
+def main(argv: list[str] | None = None) -> int:
+    """双模式主循环:浏览(--category)或搜索(--keyword)。
+
+    关键不变量: 失败页(超时/CF 未解除/缺 table.table2/0 items + 有 next_url)
+    不推进 checkpoint — 重试从同一页继续,确保不丢数据。
+
+    返回 0=完成, 2=初始页失败, 3=空中间页。
     """
-    search_url = f"{BASE}/search/{keyword}/{{page}}/"
-
-    # 断点续爬:读上次进度。done_page=已处理到的页,last_page=总页数。
-    done_page, last_page = load_checkpoint(keyword)
-    resuming = done_page > 0 and last_page > 0
-
-    def _process(html: str, page_num: int) -> None:
-        items = parse_listing(html, keyword)
-        new_count = 0
-        for it in items:
-            if coll.update_one({"_id": it["_id"]}, {"$set": it}, upsert=True).upserted_id:
-                new_count += 1
-        logger.info(f"[{page_num}/{last_page}] 解析 {len(items)} 条，新写入 MongoDB {new_count} 条")
-
-    if resuming and done_page >= last_page:
-        logger.info(f"checkpoint 显示 {keyword} 已全部完成({done_page}/{last_page}),直接收尾")
+    args = parse_args(argv)
+    mode = "search" if args.keyword else "browse"
+    category = args.search_category if mode == "search" else args.category
+    checkpoint = load_checkpoint(mode, category, args.keyword)
+    if checkpoint:
+        page_number = checkpoint["current_page"] + 1
+        url = checkpoint["next_url"]
     else:
-        if resuming:
-            start_page = done_page + 1
-            logger.info(f"断点续爬 {keyword}: 已完成 {done_page}/{last_page} 页,从第 {start_page} 页继续")
-        else:
-            # 首次运行:打开第 1 页,探测总页数并处理
-            first_html = load_page_with_retry(page, search_url.format(page=1), 1)
-            if first_html is None:
-                logger.error("第 1 页加载失败，无法启动")
-                return 2
-            # 兜底:即使拿到 html,若无结果行(CF 软墙/未渲染的空表格),
-            # 判定失败,不清 checkpoint、不写 done,交给 wrapper 重试。
-            if not has_result_rows(first_html):
-                logger.error("第 1 页无结果行(疑似被 Cloudflare 拦截或未加载完),判定失败,交给上层重试")
-                return 3
-            last_page = detect_last_page(first_html)
-            logger.info(f"搜索 {keyword} 共 {last_page} 页，开始全量翻页")
-            _process(first_html, 1)
-            done_page = 1
-            save_checkpoint(keyword, done_page, last_page)
-            start_page = 2
-
-        # 翻 start_page..N
-        for n in range(start_page, last_page + 1):
-            url = search_url.format(page=n)
-            html = load_page_with_retry(page, url, n)
-            if html is None:
-                logger.warning(f"第 {n} 页重试耗尽，跳过(标记已处理,避免卡住进度)")
-            else:
-                _process(html, n)
-            # 无论成功/跳过都推进 checkpoint,保证重试单调前进,不会永远卡在同一页
-            done_page = n
-            save_checkpoint(keyword, done_page, last_page)
-            time.sleep(PAGE_SLEEP)
-
-    total = coll.count_documents({"keyword": keyword})
-    elapsed = time.time() - started_at
-    logger.info(
-        f"=== 完成 keyword={keyword} 耗时 {elapsed:.1f}s "
-        f"库内 {DB_NAME}.{COLL_NAME} 中该 keyword 共 {total} 条 ==="
-    )
-    clear_checkpoint(keyword)  # 全部爬完,清掉 checkpoint
-    return 0
-
-
-def run_with_retry(keyword: str) -> int:
-    """共享一个 Chrome 实例,最多尝试 MAX_ATTEMPTS 次 main(keyword)。
-
-    关键设计:Chrome 只在第 1 次尝试前启动,失败后退出当前 Chrome、重启新的;
-    浏览器/CF cookie 状态不跨 attempts 保留(否则前次失败时的卡死状态可能带过来)。
-
-    返回 0=全部爬完,非 0=MAX_ATTEMPTS 次都失败。
-    """
-    env_val = os.environ.get(ENV_CONCURRENCY, "").strip()
-    logger.info(f"=== 开始抓取 keyword={keyword!r} (最多 {MAX_ATTEMPTS} 次,每次自启 Chrome) ===")
-    if env_val:
-        logger.info(f"全局并发设置:环境变量 {ENV_CONCURRENCY}={env_val}(本脚本单 key 单进程,仅记录)")
-    started_at = time.time()
+        page_number = args.start_page
+        url = (
+            build_search_url(category, args.keyword, page_number)
+            if mode == "search"
+            else build_browse_url(category, page_number)
+        )
+    if not url:
+        logger.error(
+            f"{mode} 模式无起始 url: mode={mode} category={category} "
+            f"page={page_number} keyword={args.keyword!r}"
+        )
+        return 2
 
     client = MongoClient(MONGO_URI)
     coll = client[DB_NAME][COLL_NAME]
     logger.info(f"MongoDB 已连接: {MONGO_URI}{DB_NAME}.{COLL_NAME}")
 
-    # DrissionPage 自拉 Chrome,完全独立,不接管外部 Chrome
-    # ChromiumPage 本身即一个 tab,可直接当 tab 用,无需 new_tab()
-    # auto_port(True) 强制自启独立 Chrome(不 attach 用户 9222)
-    # set_argument('--headless') 用老式 flag (不是 --headless=new),
-    # 绕过 DrissionPage 4.1.1.4 .headless(True) 在 Windows 上 ws 连接失败的 bug,
-    # 实现真 headless 无窗口运行。
-    options = (ChromiumOptions()
-               # .set_argument("--headless")
-               .auto_port(True))
-
-    rc = 1
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        page = None
-        try:
-            page = ChromiumPage(options)
-            logger.info(f"[尝试 {attempt}/{MAX_ATTEMPTS}] Chrome 已启动 (address={options.address})")
-            rc = main(keyword, page, coll, started_at)
-            if rc == 0:
-                return 0
-        except Exception as e:
-            logger.error(f"[尝试 {attempt}] 异常: {type(e).__name__}: {e}")
-            rc = 99
-        finally:
-            if page is not None:
-                try:
-                    page.quit()
-                    logger.info(f"[尝试 {attempt}] Chrome 已关闭")
-                except Exception as e:
-                    logger.warning(f"[尝试 {attempt}] 关闭 Chrome 异常: {type(e).__name__}: {e}")
-
-        if attempt < MAX_ATTEMPTS:
-            logger.warning(
-                f"[尝试 {attempt}] 失败 rc={rc},{RETRY_BACKOFF}s 后从中断页续爬"
+    processed_pages = 0
+    browser = ChromiumPage(ChromiumOptions().auto_port(True))
+    try:
+        while url:
+            html = load_page_with_retry(browser, url, page_number)
+            if html is None or not has_result_table(html):
+                logger.warning(
+                    f"第 {page_number} 页失败(加载={html is None} 或无结果表),"
+                    f"不推进 checkpoint,留给上层重试"
+                )
+                return 2
+            items = parse_listing(
+                html,
+                mode=mode,
+                category=category,
+                keyword=args.keyword,
             )
-            time.sleep(RETRY_BACKOFF)
+            next_url = detect_next_url(html, url)
+            if not items and next_url:
+                logger.warning(
+                    f"第 {page_number} 页解析出 0 条但仍有 next_url,疑似站点改版,"
+                    f"不推进 checkpoint"
+                )
+                return 3
+            new_count = 0
+            for item in items:
+                if upsert_listing(coll, item):
+                    new_count += 1
+            logger.info(
+                f"[{mode}/{category}] 第 {page_number} 页解析 {len(items)} 条"
+                f" 新写入 {new_count} 条"
+            )
+            save_checkpoint({
+                "query_type": mode,
+                "category": category,
+                "keyword": args.keyword,
+                "current_page": page_number,
+                "next_url": next_url,
+                "updated_at": now_str(),
+            })
+            processed_pages += 1
+            if args.max_pages and processed_pages >= args.max_pages:
+                logger.info(
+                    f"已达 --max-pages={args.max_pages} 上限,保留 checkpoint 供下次续跑"
+                )
+                return 0
+            if next_url is None:
+                logger.info(
+                    f"{mode}/{category} 已无 next_url,全部爬完,清除 checkpoint"
+                )
+                clear_checkpoint(mode, category, args.keyword)
+                return 0
+            url = next_url
+            page_number += 1
+            time.sleep(args.page_sleep)
+        logger.info(
+            f"{mode}/{category} 主循环正常退出,清除 checkpoint"
+        )
+        clear_checkpoint(mode, category, args.keyword)
+        return 0
+    finally:
+        try:
+            browser.quit()
+            logger.info("Chrome 已关闭")
+        except Exception as e:
+            logger.warning(f"关闭 Chrome 异常: {type(e).__name__}: {e}")
 
-    logger.error(f"=== 失败 keyword={keyword} {MAX_ATTEMPTS} 次尝试均失败 ===")
-    return rc
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """CLI 参数解析。
+
+    mode 决策: 提供 --keyword → search,否则 browse。
+    浏览分类默认 Movies;搜索分类默认 all(允许 all,不允许其他无效分类)。
+    """
+    parser = argparse.ArgumentParser(
+        description="LimeTorrents 列表与关键词爬虫",
+    )
+    parser.add_argument(
+        "--keyword",
+        help="提供后进入关键词搜索模式;省略则进入分类浏览模式",
+    )
+    parser.add_argument(
+        "--category",
+        default="Movies",
+        help="浏览模式下的分类,默认 Movies",
+    )
+    parser.add_argument(
+        "--search-category",
+        default="all",
+        help="搜索模式下的分类,默认 all",
+    )
+    parser.add_argument(
+        "--start-page",
+        type=int,
+        default=1,
+        help="起始页码,默认 1;仅无 checkpoint 时生效",
+    )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=0,
+        help="本次最多处理的页数,0=直到没有下一页",
+    )
+    parser.add_argument(
+        "--page-sleep",
+        type=float,
+        default=PAGE_SLEEP,
+        help="页间间隔秒数",
+    )
+    args = parser.parse_args(argv)
+    if args.start_page < 1:
+        parser.error("--start-page 必须大于等于 1")
+    if args.max_pages < 0:
+        parser.error("--max-pages 必须大于等于 0")
+    if args.page_sleep < 0:
+        parser.error("--page-sleep 不能为负")
+    args.category = normalize_category(args.category)
+    args.search_category = normalize_category(args.search_category, allow_all=True)
+    if args.keyword is not None:
+        slugify_keyword(args.keyword)
+    return args
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="1337x 单关键词全量抓取（落 MongoDB）",
-    )
-    parser.add_argument(
-        "keyword",
-        help="搜索关键词（会作为 MongoDB 文档 keyword 字段值）",
-    )
-    args = parser.parse_args()
-    sys.exit(run_with_retry(args.keyword))
+    sys.exit(main())

@@ -1,7 +1,8 @@
-"""crawl_1337x_by_key.py 空结果页判定的测试。
+"""LimeTorrents 列表空结果页判定的冒烟测试。
 
-针对 bug: 空的 table.table-list(0 行)被当成"有效且爬完",写入 done.txt。
-修复: has_result_rows() 判定页面是否含真实结果行,main() 据此决定成败。
+针对 bug: Cloudflare 软墙 / 未渲染返回的空表格骨架会被当成"有效页面"误判爬完。
+修复: has_result_table() 判定页面是否含 table.table2;parse_listing 在没有真实
+行时返回 []。失败页不推进 checkpoint,由 wrapper 重试。
 
 直接跑:python test_empty_page.py
 """
@@ -21,52 +22,22 @@ def check(cond, msg):
         failures.append(msg)
 
 
-# Cloudflare 软墙 / 未渲染:表格骨架在,但 tbody 无行,也无分页
-EMPTY_HTML = """
-<html><body>
-<table class="table-list">
-  <thead><tr><th class="coll-1 name">Name</th></tr></thead>
-  <tbody></tbody>
-</table>
-</body></html>
-"""
-
-# 正常有结果:1 行 + 分页到第 3 页
-POPULATED_HTML = """
-<html><body>
-<table class="table-list">
-  <thead><tr><th class="coll-1 name">Name</th></tr></thead>
-  <tbody>
-    <tr>
-      <td class="coll-1 name"><a href="/x/1/">icon</a><a href="/torrent/123/foo/">Foo Movie</a></td>
-      <td class="coll-2 seeds">42</td>
-      <td class="coll-3 leeches">7</td>
-      <td class="coll-date">Oct. 21st '22</td>
-      <td class="coll-4 size">1.6 GB</td>
-      <td class="coll-5">uploaderX</td>
-    </tr>
-  </tbody>
-</table>
-<div class="pagination">
-  <a href="/search/foo/2/">2</a>
-  <a href="/search/foo/3/">3</a>
-</div>
-</body></html>
-"""
-
-
 def main():
-    # 1. 空页面:无结果行
-    check(ck.has_result_rows(EMPTY_HTML) is False, "空表格 → has_result_rows False")
-    check(ck.parse_listing(EMPTY_HTML, "005") == [], "空表格 → parse_listing 0 条")
-    check(ck.detect_last_page(EMPTY_HTML) == 1, "空表格无分页 → last_page 1")
+    # 1. 完全无结果表 → has_result_table False
+    check(ck.has_result_table("<html></html>") is False, "无 table.table2 → False")
 
-    # 2. 正常页面:有结果行
-    check(ck.has_result_rows(POPULATED_HTML) is True, "有行 → has_result_rows True")
-    items = ck.parse_listing(POPULATED_HTML, "005")
-    check(len(items) == 1, "有行 → parse_listing 1 条")
-    check(items and items[0]["name"] == "Foo Movie", "解析出正确 name")
-    check(ck.detect_last_page(POPULATED_HTML) == 3, "分页 → last_page 3")
+    # 2. 只有表头 → has_result_table True,parse_listing 出 0 条
+    only_header = "<table class='table2'><tr><th>Torrent Name</th></tr></table>"
+    check(ck.has_result_table(only_header) is True, "仅表头骨架 → has_result_table True")
+    items = ck.parse_listing(only_header, mode="browse", category="Movies")
+    check(items == [], "仅表头 → parse_listing 0 条")
+
+    # 3. 真实 fixture 必须能解析出 items(防回归)
+    from tests.conftest import fixture
+    real = fixture("limetorrents_browse_movies_page2.html")
+    check(ck.has_result_table(real) is True, "真实浏览页 → has_result_table True")
+    items = ck.parse_listing(real, mode="browse", category="Movies")
+    check(items and len(items) >= 35, f"真实浏览页解析 ≥35 条(实际 {len(items)})")
 
     print()
     if failures:
