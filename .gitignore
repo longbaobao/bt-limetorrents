@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/html/*.html
+data/html/*.parsed.txt
+data/html/_progress.log
+data/keys-done.txt
+data/checkpoints/
+!data/html/.gitkeep
+.claude/worktrees/
+.idea/
+.serena/
+.superpowers/
+截图/
