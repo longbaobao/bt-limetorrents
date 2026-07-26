@@ -45,25 +45,26 @@ WORKER_TIMEOUT = 600
 
 # 全局并发设置:环境变量优先,默认 1(纯串行,向后兼容)
 # 范围 [1, 16];CLI --concurrency 可临时覆盖
-ENV_CONCURRENCY = "CRAWL_LIMETORRENTS_CONCURRENCY"
+CRAWL_LIMETORRENTS_CONCURRENCY = "CRAWL_LIMETORRENTS_CONCURRENCY"
 DEFAULT_CONCURRENCY = 1
 MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 16
+_DONE_LOCK = threading.Lock()
 
 
 def resolve_concurrency() -> int:
     """从环境变量读默认值(若非法回退到 1),CLI --concurrency 会在 argparse 后覆盖。"""
-    raw = os.environ.get(ENV_CONCURRENCY)
+    raw = os.environ.get(CRAWL_LIMETORRENTS_CONCURRENCY)
     if raw is None or raw.strip() == "":
         return DEFAULT_CONCURRENCY
     try:
         v = int(raw)
     except ValueError:
-        logger.warning(f"环境变量 {ENV_CONCURRENCY}={raw!r} 不是合法整数,回退默认 {DEFAULT_CONCURRENCY}")
+        logger.warning(f"环境变量 {CRAWL_LIMETORRENTS_CONCURRENCY}={raw!r} 不是合法整数,回退默认 {DEFAULT_CONCURRENCY}")
         return DEFAULT_CONCURRENCY
     if not (MIN_CONCURRENCY <= v <= MAX_CONCURRENCY):
         logger.warning(
-            f"环境变量 {ENV_CONCURRENCY}={v} 超出范围 [{MIN_CONCURRENCY}, {MAX_CONCURRENCY}],回退默认 {DEFAULT_CONCURRENCY}"
+            f"环境变量 {CRAWL_LIMETORRENTS_CONCURRENCY}={v} 超出范围 [{MIN_CONCURRENCY}, {MAX_CONCURRENCY}],回退默认 {DEFAULT_CONCURRENCY}"
         )
         return DEFAULT_CONCURRENCY
     return v
@@ -96,15 +97,27 @@ def load_done() -> set[str]:
     }
 
 
-def append_done(key: str, lock: threading.Lock) -> None:
+def append_done(key: str, lock=None) -> None:
     """线程安全地追加一行到 done.txt 并 flush。"""
-    with lock:
+    active_lock = lock or _DONE_LOCK
+    with active_lock:
         with DONE_FILE.open("a", encoding="utf-8") as f:
             f.write(key + "\n")
             f.flush()
 
 
-def run_one(key: str) -> tuple[str, int, str]:
+def build_worker_args(key: str, search_category: str) -> list[str]:
+    return [
+        sys.executable,
+        SCRIPT,
+        "--keyword",
+        key,
+        "--search-category",
+        search_category,
+    ]
+
+
+def run_one(key: str, search_category: str) -> tuple[str, int, str]:
     """subprocess 跑单个 key。返回 (key, returncode, stderr_tail)。
 
     重试逻辑不在子脚本内做:子脚本失败直接 returncode 非 0,checkpoint 保留,
@@ -114,7 +127,7 @@ def run_one(key: str) -> tuple[str, int, str]:
 
     stdout 透传到父进程(实时看到子脚本的中文进度),stderr 截留备用(失败时 dump 尾部)。
     """
-    args = [sys.executable, SCRIPT, key]
+    args = build_worker_args(key, search_category)
     logger.info(
         f"[开始] {key} pid={os.getpid()} "
         f"(DrissionPage 子脚本内自启 Chrome,失败由 checkpoint 续爬)"
@@ -134,25 +147,26 @@ def run_one(key: str) -> tuple[str, int, str]:
         stderr_tail = "\n".join((proc.stderr or "").splitlines()[-10:])
         return key, proc.returncode, stderr_tail
     except subprocess.TimeoutExpired:
-        return key, 124, f"timeout after {WORKER_TIMEOUT}s(子进程可能被强制终止,断点已保存)"
-    except Exception as e:
-        return key, 1, f"wrapper exception: {type(e).__name__}: {e}"
+        return key, 124, f"timeout after {WORKER_TIMEOUT}s"
+    except Exception as exc:
+        return key, 1, f"{type(exc).__name__}: {exc}"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="1337x 多关键词并发抓取 wrapper")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="LimeTorrents 多关键词并发抓取 wrapper")
+    parser.add_argument("--search-category", default="all")
     parser.add_argument(
         "-c", "--concurrency", type=int, default=resolve_concurrency(), choices=range(MIN_CONCURRENCY, MAX_CONCURRENCY + 1), metavar="N",
         help=(
             f"并发 worker 数(范围 [{MIN_CONCURRENCY}, {MAX_CONCURRENCY}],默认读环境变量"
-            f" {ENV_CONCURRENCY}={DEFAULT_CONCURRENCY};每个 worker 由 DrissionPage 子脚本自启独立 Chrome)"
+            f" {CRAWL_LIMETORRENTS_CONCURRENCY}={DEFAULT_CONCURRENCY};每个 worker 由 DrissionPage 子脚本自启独立 Chrome)"
         ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     concurrency: int = args.concurrency
-    env_val = os.environ.get(ENV_CONCURRENCY)
+    env_val = os.environ.get(CRAWL_LIMETORRENTS_CONCURRENCY)
     if env_val and env_val.strip():
-        logger.info(f"全局并发设置:环境变量 {ENV_CONCURRENCY}={env_val}(本次实际并发={concurrency})")
+        logger.info(f"全局并发设置:环境变量 {CRAWL_LIMETORRENTS_CONCURRENCY}={env_val}(本次实际并发={concurrency})")
 
     keys = load_keys()
     done = load_done()
@@ -165,7 +179,6 @@ def main() -> int:
         logger.info("无新 key 待处理,退出")
         return 0
 
-    done_lock = threading.Lock()
     failed: list[tuple[str, str]] = []
     started_at = time.time()
 
@@ -174,7 +187,7 @@ def main() -> int:
         worker_started: dict[concurrent.futures.Future, float] = {}
         for key in pending:
             logger.info(f"[入队] {key}")
-            fut = pool.submit(run_one, key)
+            fut = pool.submit(run_one, key, args.search_category)
             futures[fut] = key
             worker_started[fut] = time.time()
         for fut in concurrent.futures.as_completed(futures):
@@ -187,12 +200,12 @@ def main() -> int:
                 logger.error(f"[失败] {key} 耗时 {worker_elapsed:.1f}s 异常: {e}")
                 continue
             if rc == 0:
-                append_done(key, done_lock)
+                append_done(key)
                 logger.info(f"[完成] {key} 耗时 {worker_elapsed:.1f}s → 已写入 done.txt")
             else:
                 logger.error(
                     f"[失败] {key} 耗时 {worker_elapsed:.1f}s 退出码={rc} "
-                    f"(子脚本内已自重试,断点已保留下次可续爬)\n{stderr_tail}"
+                    f"(子脚本失败，断点已保留下次可续爬)\n{stderr_tail}"
                 )
                 failed.append((key, f"退出码={rc}"))
 
