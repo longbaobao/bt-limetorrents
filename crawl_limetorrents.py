@@ -243,67 +243,131 @@ def detect_last_page(html: str) -> int:
 
 
 def has_result_rows(html: str) -> bool:
-    """页面是否含至少一行结果(table.table-list 里有 tbody tr)。
+    """1337x 页面是否含至少一行结果(table.table-list 里有 tbody tr)。
 
     用于区分「正常有结果」与「Cloudflare 软墙/未渲染返回的空表格骨架」。
-    1337x 有结果时表格必有行;拿到 0 行几乎都是被挡或没加载完,不能当成爬完。
+    仅保留供 1337x 旧路径使用；LimeTorrents 列表判定走 has_result_table()。
     """
     soup = BeautifulSoup(html, "html.parser")
     return bool(soup.select("table.table-list tbody tr"))
 
 
-def parse_listing(html: str, keyword: str) -> list[dict]:
-    """解析搜索结果表格的每一行。
+# ============================================================================
+# LimeTorrents 列表解析 (Task 3)
+# 列表/搜索页结构：
+#   table.table2 → 真实结果行(每行: td.tdleft 含 name/detail/torrent 链接,
+#                td.tdnormal x2 = Added/Size, td.tdseed, td.tdleech, td.tdright Health)
+#   table.table3 → Sponsored Links (必须忽略)
+# 详情链接正则: -torrent-<数字>.html
+# Torrent 直链: .torrent (实际是 itorrents.net/HASH.torrent 形式)
+# ============================================================================
 
-    1337x 真实列结构（注意 time 用的是 coll-date，不是 coll-4）：
-        coll-1     name (含 HD 图标)
-        coll-2     seeds
-        coll-3     leeches
-        coll-date  time
-        coll-4     size (mobile 视图拼了 seeds 在末尾，形如 "1.6 GB 7545")
-        coll-5     uploader
+DETAIL_HREF_RE = re.compile(r"-torrent-\d+\.html(?:$|\?)", re.IGNORECASE)
+
+
+def _as_int(text: str) -> int:
+    digits = re.sub(r"[^0-9]", "", text)
+    return int(digits) if digits else 0
+
+
+def extract_added_category(text: str, fallback: str) -> tuple[str, str]:
+    """把 'Added' 单元格文本切成 (added_text, category)。
+
+    搜索结果 added_text 形如 '10 hours ago - in Movies';
+    浏览页形如 '10 hours ago'(无 in 子串)→ 保留原文 + fallback。
     """
+    match = re.search(r"\s+-?\s*in\s+(.+?)\s*$", text, re.IGNORECASE)
+    if not match:
+        return text.strip(), fallback
+    category = normalize_category(match.group(1), allow_all=False)
+    added_text = text[:match.start()].strip()
+    return added_text, category
+
+
+def parse_result_row(row, *, fallback_category: str, ref_now: datetime) -> dict | None:
+    """解析 LimeTorrents 单行结果。
+
+    返回 None 表示该行无效(没有 -torrent-N.html 详情链接;
+    通常是表头 Sponsored 行的 td.tdleft 或损坏结构)。
+    """
+    detail_link = None
+    torrent_link = None
+    for link in row.select("td.tdleft a[href]"):
+        href = link.get("href", "")
+        if DETAIL_HREF_RE.search(href):
+            detail_link = link
+        elif ".torrent" in href.lower():
+            torrent_link = link
+    if detail_link is None:
+        return None
+
+    normal_cells = row.select("td.tdnormal")
+    added_raw = normal_cells[0].get_text(" ", strip=True) if normal_cells else ""
+    size = normal_cells[1].get_text(" ", strip=True) if len(normal_cells) > 1 else ""
+    added_text, category = extract_added_category(added_raw, fallback_category)
+    detail_url = urljoin(BASE, detail_link.get("href", ""))
+    observed_at = ref_now.strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "_id": hashlib.md5(detail_url.encode("utf-8")).hexdigest(),
+        "name": detail_link.get_text(" ", strip=True),
+        "detail_url": detail_url,
+        "torrent_url": urljoin(BASE, torrent_link.get("href", "")) if torrent_link else "",
+        "category": category,
+        "added_text": added_raw,
+        "added_at": parse_limetorrents_time(added_raw, ref_now),
+        "size": size,
+        "seeders": _as_int(row.select_one("td.tdseed").get_text(strip=True)) if row.select_one("td.tdseed") else 0,
+        "leechers": _as_int(row.select_one("td.tdleech").get_text(strip=True)) if row.select_one("td.tdleech") else 0,
+        "observed_at": observed_at,
+        "source": "limetorrents",
+    }
+
+
+def parse_listing(
+    html: str,
+    *,
+    mode: str,
+    category: str,
+    keyword: str | None = None,
+    ref_now: datetime | None = None,
+) -> list[dict]:
+    """解析 LimeTorrents 浏览/搜索列表(LimeTorrents 列表层级,与 1337x parse_listing 不同)。
+
+    只走 table.table2;Sponsored 的 table.table3 自动忽略。
+    """
+    if mode not in {"browse", "search"}:
+        raise ValueError(f"未知 mode: {mode}")
+    ref_now = ref_now or datetime.now()
     soup = BeautifulSoup(html, "html.parser")
-    items = []
-    for tr in soup.select("table.table-list tbody tr"):
-        try:
-            # coll-1 里通常有两个 <a>：第一个是图标（HD 标志），第二个是名字
-            anchors = tr.select("td.coll-1 a")
-            name_anchor = anchors[1] if len(anchors) >= 2 else (anchors[0] if anchors else None)
-            if not name_anchor:
+    result = []
+    for table in soup.select("table.table2"):
+        for row in table.select("tr"):
+            if row.select_one("th"):
                 continue
-            name = name_anchor.get_text(strip=True)
-            detail_url = urljoin(BASE, name_anchor.get("href", ""))
+            item = parse_result_row(
+                row,
+                fallback_category=category,
+                ref_now=ref_now,
+            )
+            if item:
+                item["discovery_mode"] = mode
+                item["keyword"] = keyword
+                result.append(item)
+    return result
 
-            seeds_txt = tr.select_one("td.coll-2").get_text(strip=True) if tr.select_one("td.coll-2") else "0"
-            leech_txt = tr.select_one("td.coll-3").get_text(strip=True) if tr.select_one("td.coll-3") else "0"
 
-            # 时间列 class 是 coll-date，不是 coll-4
-            time_txt = tr.select_one("td.coll-date").get_text(strip=True) if tr.select_one("td.coll-date") else ""
+def has_result_table(html: str) -> bool:
+    """LimeTorrents 列表页是否含真实结果表(table.table2)。"""
+    return BeautifulSoup(html, "html.parser").select_one("table.table2") is not None
 
-            # size 单元格 mobile 视图拼了 seeds 在末尾，形如 "1.6 GB 7545"，只取前两段
-            size_cell = tr.select_one("td.coll-4")
-            size = " ".join(size_cell.get_text(" ", strip=True).split()[:2]) if size_cell else ""
 
-            uploader = tr.select_one("td.coll-5").get_text(strip=True) if tr.select_one("td.coll-5") else ""
-
-            item = {
-                "_id": hashlib.md5(detail_url.encode()).hexdigest(),
-                "name": name,
-                "detail_url": detail_url,
-                "seeds": int(seeds_txt) if seeds_txt.isdigit() else 0,
-                "leechers": int(leech_txt) if leech_txt.isdigit() else 0,
-                "size": size,
-                "list_time": parse_1337x_time(time_txt),
-                "uploader": uploader,
-                "keyword": keyword,
-                "source": "1337x",
-                "c_time": datetime.now(),
-            }
-            items.append(item)
-        except Exception as e:
-            logger.warning(f"解析行失败: {e}")
-    return items
+def detect_next_url(html: str, current_url: str) -> str | None:
+    """从分页栏找 Next page 链接,基于当前页 URL 拼接绝对地址。"""
+    soup = BeautifulSoup(html, "html.parser")
+    for link in soup.select("a[href]"):
+        if link.get_text(" ", strip=True).lower() == "next page":
+            return urljoin(current_url, link["href"])
+    return None
 
 
 def load_page_with_retry(tab, url: str, page_num: int, retries: int = 3) -> str | None:
