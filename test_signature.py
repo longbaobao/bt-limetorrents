@@ -5,6 +5,13 @@
 - parse_args(argv) 双模式参数(浏览 / 关键词),分类与搜索分类分开
 - parse_listing(html, *, mode, category, keyword) 解析 table.table2
 
+详情爬虫 (crawl_detail_limetorrents):
+- main(argv) -> int 接收 argv 自启 Chrome 并返回 exit code
+- parse_args(argv) 单参签名
+- run_one(tab, doc, coll_list, coll_detail, dry_run=False) -> str
+- claim_one / mark_done / mark_failed 状态机
+- html_cache_path / fetch_one / save_html_cache / build_pending_query
+
 直接跑:python test_signature.py
 """
 import sys
@@ -12,6 +19,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 import inspect
 
 import crawl_limetorrents as ck
+import crawl_detail_limetorrents as dk
 
 failures = []
 
@@ -78,6 +86,65 @@ def main():
         params == ["coll", "item"],
         f"upsert_listing(coll, item): {params}",
     )
+
+    # 8. crawl_detail_limetorrents: main(argv) 单参并自启 Chrome
+    check(callable(dk.main), "detail.main 可调用")
+    check(callable(dk.parse_args), "detail.parse_args 可调用")
+    check(callable(dk.run_one), "detail.run_one 可调用")
+    sig = inspect.signature(dk.main)
+    params = list(sig.parameters.keys())
+    check(params == ["argv"], f"detail.main(argv) 单参签名: {params}")
+    src = inspect.getsource(dk.main)
+    check("ChromiumPage(" in src, "detail.main() 创建 ChromiumPage(自启 Chrome)")
+    check("browser.quit()" in src, "detail.main() 在 finally 调 browser.quit()")
+
+    # 9. detail.parse_args(argv) 单参签名
+    sig = inspect.signature(dk.parse_args)
+    params = list(sig.parameters.keys())
+    check(params == ["argv"], f"detail.parse_args(argv) 单参签名: {params}")
+
+    # 10. detail.run_one(tab, doc, coll_list, coll_detail, dry_run=False)
+    sig = inspect.signature(dk.run_one)
+    params = list(sig.parameters.keys())
+    check(
+        params == ["tab", "doc", "coll_list", "coll_detail", "dry_run"],
+        f"detail.run_one(tab, doc, coll_list, coll_detail, dry_run): {params}",
+    )
+
+    # 11. 状态机三件套
+    sig = inspect.signature(dk.claim_one)
+    params = list(sig.parameters.keys())
+    check(params == ["coll_list", "doc_id"], f"detail.claim_one(coll_list, doc_id): {params}")
+    sig = inspect.signature(dk.mark_done)
+    params = list(sig.parameters.keys())
+    check(params == ["coll_list", "doc_id"], f"detail.mark_done(coll_list, doc_id): {params}")
+    sig = inspect.signature(dk.mark_failed)
+    params = list(sig.parameters.keys())
+    check(
+        params == ["coll_list", "doc_id", "error_msg"],
+        f"detail.mark_failed(coll_list, doc_id, error_msg): {params}",
+    )
+
+    # 12. 缓存与查询
+    sig = inspect.signature(dk.html_cache_path)
+    params = list(sig.parameters.keys())
+    check(params == ["detail_url"], f"detail.html_cache_path(detail_url): {params}")
+    sig = inspect.signature(dk.fetch_one)
+    params = list(sig.parameters.keys())
+    check(params == ["tab", "url"], f"detail.fetch_one(tab, url): {params}")
+    sig = inspect.signature(dk.save_html_cache)
+    params = list(sig.parameters.keys())
+    check(
+        params == ["detail_url", "html"],
+        f"detail.save_html_cache(detail_url, html): {params}",
+    )
+    sig = inspect.signature(dk.build_pending_query)
+    params = list(sig.parameters.keys())
+    check(params == ["keyword"], f"detail.build_pending_query(keyword): {params}")
+
+    # 13. 详情爬虫不再含 1337x 字样
+    src = inspect.getsource(dk)
+    check("1337x" not in src, "crawl_detail_limetorrents 无 1337x 字样")
 
     print()
     if failures:

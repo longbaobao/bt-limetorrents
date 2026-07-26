@@ -5,6 +5,12 @@ DrissionPage 自启 headless Chrome（auto_port 强制独立进程），不接�
 - 并发模型：ThreadPoolExecutor(max_workers=concurrency)，每个 worker 一个独立 tab
 - 单 tab timeout 走 future.result(timeout=RUN_ONE_BUDGET)
 - 浏览器死亡快检：批开始前先 new_tab() 一次，失败则整批跳过
+
+状态机：detail_status ∈ {pending, processing, done, failed}。
+- claim_one: pending → processing（CAS）
+- mark_done: processing → done
+- mark_failed: processing → failed（保留 detail_error）
+- DocumentTooLarge 显式失败，不切片不截断 files
 """
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
@@ -48,7 +54,7 @@ MAX_RETRIES = 3
 RETRY_BACKOFF = (2, 4, 8)  # 秒
 RUN_ONE_BUDGET = 60  # 秒
 INTER_REQUEST_SLEEP = 0.5  # 秒，每次 fetch 成功后的间隔
-CONCURRENCY = 1  # 默认并行 page 数
+CONCURRENCY = 2  # 默认并行 page 数
 
 
 def now_str() -> str:
@@ -155,6 +161,18 @@ def rescue_orphaned_processing(coll_list) -> int:
          "$unset": {"detail_started_at": ""}},
     )
     return r.modified_count
+
+
+def build_pending_query(keyword: str | None = None) -> dict:
+    """构造 pending 文档查询。
+
+    - 默认：仅 detail_status=pending。
+    - keyword 非空时附加 `keywords` 数组精确匹配；done 永远不会被此查询命中。
+    """
+    query = {"detail_status": "pending"}
+    if keyword:
+        query["keywords"] = keyword
+    return query
 
 
 class ParseError(Exception):
@@ -435,11 +453,10 @@ def parse_detail(
 def fetch_one(tab, url: str) -> str:
     """访问详情页并返回 HTML 字符串。Cloudflare 5秒盾由 fetch_with_cf_bypass 自动等待。
 
+    目标选择器 `css:div.torrentinfo` 命中 LimeTorrents 详情正文容器。
     Raises: TimeoutError (目标元素始终未出现) / 原始 DrissionPage 异常。
     """
-    return fetch_with_cf_bypass(
-        tab, url, "div.torrent-detail, div.box-info-heading", max_wait=45
-    )
+    return fetch_with_cf_bypass(tab, url, "css:div.torrentinfo", max_wait=45)
 
 
 def save_html_cache(detail_url: str, html: str) -> None:
@@ -467,94 +484,60 @@ logger = logging.getLogger(__name__)
 def run_one(tab, doc: dict, coll_list, coll_detail, dry_run: bool = False) -> str:
     """处理单条 URL → 持久化一条记录。返回 'done' 或 'failed'。
 
-    单 URL 顺序：
-        claim（main loop 里完成）
-        → fetch HTML（或读缓存）
-        → parse_detail
-        → upsert_detail（非 dry_run）
-        → mark_done（非 dry_run）
-        → time.sleep(INTER_REQUEST_SLEEP)
-        → 下一条
+    顺序固定：fetch → cache → parse → replace/upsert → done。
 
-    缓存命中：直接读 HTML，跳过 fetch + retry。
-    缓存未命中：retry loop 内 fetch + cache save + parse + save。
-    - ElementNotFoundError / PageDisconnectedError → 重试 MAX_RETRIES 次（间或用 RETRY_BACKOFF）
-    - ParseError → 不重试，直接 failed
-    - 其他异常 → 重试 MAX_RETRIES 次
+    异常分类：
+    - DocumentTooLarge → 不重试，立即 failed（不切片不截断 files）
+    - ParseError       → 不重试，立即 failed
+    - 其他异常         → 最多重试 MAX_RETRIES 次（间或 RETRY_BACKOFF）
     """
+    from pymongo.errors import DocumentTooLarge
+
     doc_id = doc["_id"]
     url = doc["detail_url"]
     short_id = doc_id[:8]
-    last_err = None
-
+    last_error = ""
     name = doc.get("name", "")
     logger.info(f"[{short_id}] 开始处理：{name}")
 
-    # 缓存命中分支：直接读 HTML，跳过 fetch + retry
-    cache_path = html_cache_path(url)
-    if cache_path.exists():
-        logger.info(f"[{short_id}] 缓存命中，跳过下载：{cache_path.name}")
-        try:
-            html = cache_path.read_text(encoding="utf-8")
-        except OSError as e:
-            last_err = f"CacheReadError: {e}"
-            logger.error(f"[{short_id}] 读取缓存失败：{e}")
-            if not dry_run:
-                mark_failed(coll_list, doc_id, last_err)
-            return "failed"
-        try:
-            parsed = parse_detail(html, url)
-        except ParseError as e:
-            last_err = f"ParseError: {e}"
-            logger.error(f"[{short_id}] 解析失败（缓存）：{e}")
-            if not dry_run:
-                mark_failed(coll_list, doc_id, last_err)
-            return "failed"
-        if not dry_run:
-            upsert_detail(coll_detail, parsed)
-            mark_done(coll_list, doc_id)
-        logger.info(f"[{short_id}] 处理完成（缓存命中）→ done | title={parsed.get('title', '')!r}")
-        _time.sleep(INTER_REQUEST_SLEEP)
-        return "done"
-
-    # 缓存未命中：retry loop
-    logger.info(f"[{short_id}] 缓存未命中，开始下载：{url}")
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            logger.info(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次尝试：fetch_one")
             html = fetch_one(tab, url)
-            logger.info(f"[{short_id}] 下载完成，HTML {len(html)} 字节，保存到缓存")
             save_html_cache(url, html)
-            logger.info(f"[{short_id}] 开始解析详情页")
             parsed = parse_detail(html, url)
-            logger.info(f"[{short_id}] 解析完成：title={parsed.get('title', '')!r}")
-            if not dry_run:
-                upsert_detail(coll_detail, parsed)
-                logger.info(f"[{short_id}] 已写入 bt_info_detail")
-                mark_done(coll_list, doc_id)
-                logger.info(f"[{short_id}] 状态已更新 → done")
-            else:
-                logger.info(f"[{short_id}] dry-run 模式，跳过 DB 写入")
-            _time.sleep(INTER_REQUEST_SLEEP)
+            if dry_run:
+                logger.info(
+                    "dry-run %s hash=%s files=%s trackers=%s",
+                    url,
+                    parsed["info_hash"],
+                    parsed["file_entry_count"],
+                    parsed["tracker_count"],
+                )
+                return "done"
+            coll_detail.replace_one({"_id": parsed["_id"]}, parsed, upsert=True)
+            mark_done(coll_list, doc_id)
             return "done"
-        except (ElementNotFoundError, PageDisconnectedError) as e:
-            last_err = f"DrissionError: {type(e).__name__}: {e}"
-            logger.warning(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次浏览器错误：{last_err}")
-            if attempt < MAX_RETRIES:
-                _time.sleep(RETRY_BACKOFF[attempt - 1])
-        except ParseError as e:
-            last_err = f"ParseError: {e}"
-            logger.error(f"[{short_id}] 解析失败（不可重试）：{e}")
-            break
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            logger.warning(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次未知错误：{last_err}")
+        except DocumentTooLarge as exc:
+            last_error = f"DocumentTooLarge: {exc}"
+            logger.error(f"[{short_id}] 文档超过 16MB，标记 failed: {last_error}")
+            if not dry_run:
+                mark_failed(coll_list, doc_id, last_error)
+            return "failed"
+        except ParseError as exc:
+            last_error = f"ParseError: {exc}"
+            logger.error(f"[{short_id}] 解析失败（不可重试）：{last_error}")
+            if not dry_run:
+                mark_failed(coll_list, doc_id, last_error)
+            return "failed"
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(f"[{short_id}] 第 {attempt}/{MAX_RETRIES} 次错误：{last_error}")
             if attempt < MAX_RETRIES:
                 _time.sleep(RETRY_BACKOFF[attempt - 1])
 
-    logger.error(f"[{short_id}] 重试耗尽，标记 failed：{last_err}")
+    logger.error(f"[{short_id}] 重试耗尽，标记 failed：{last_error}")
     if not dry_run:
-        mark_failed(coll_list, doc_id, last_err or "unknown")
+        mark_failed(coll_list, doc_id, last_error or "unknown")
     return "failed"
 
 
@@ -620,30 +603,45 @@ def run_batch(browser: ChromiumPage, docs: list, coll_list, coll_detail, concurr
     return done, failed
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="1337x 详情页爬虫")
-    p.add_argument("-c", "--concurrency", type=int, default=CONCURRENCY, help="并行 page 数")
-    p.add_argument("-b", "--batch", type=int, default=BATCH, help="每批从 MongoDB 取多少条")
-    p.add_argument("-p", "--pace", type=float, default=1.0, help="批次间停顿秒数")
-    p.add_argument("-l", "--limit", type=int, default=0, help="最多处理多少条（0=不限）")
-    p.add_argument("-k", "--keyword", type=str, default=None, help="只处理指定 keyword")
-    p.add_argument("--force", action="store_true", help="无视 status 强制重跑")
-    p.add_argument("--retry-failed", action="store_true", help="重置 failed → pending 后再跑")
-    p.add_argument("--dry-run", action="store_true", help="只解析不写")
-    return p.parse_args()
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """CLI 参数解析。"""
+    parser = argparse.ArgumentParser(description="LimeTorrents 详情爬虫")
+    parser.add_argument("-c", "--concurrency", type=int, default=CONCURRENCY, help="并行 page 数")
+    parser.add_argument("-b", "--batch", type=int, default=BATCH, help="每批从 MongoDB 取多少条")
+    parser.add_argument("-p", "--pace", type=float, default=1.0, help="批次间停顿秒数")
+    parser.add_argument("-l", "--limit", type=int, default=0, help="最多处理多少条（0=不限）")
+    parser.add_argument("-k", "--keyword", type=str, default=None, help="只处理指定 keyword")
+    parser.add_argument("--force", action="store_true", help="无视 status 强制重跑")
+    parser.add_argument("--retry-failed", action="store_true", help="重置 failed → pending 后再跑")
+    parser.add_argument("--dry-run", action="store_true", help="只解析不写")
+    args = parser.parse_args(argv)
+    if args.concurrency < 1:
+        parser.error("--concurrency 必须大于等于 1")
+    return args
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    """主循环入口。返回 0=正常退出。
+
+    流程：
+        1. startup 重建（force / retry-failed / 孤儿 recovery）
+        2. CAS 抢占 pending
+        3. 批次循环 + 并发调度
+        4. 退出前孤儿恢复（反向置回 processing → pending）
+    """
+    args = parse_args(argv)
     from pymongo import MongoClient
     client = MongoClient(MONGO_URI)
     coll_list = client[DB_NAME][COLL_LIST]
     coll_detail = client[DB_NAME][COLL_DETAIL]
 
-    # --force: 重置全部为 pending
+    # 构造重置 scope：--keyword 提供时只动该 keyword 的文档
+    scope = {"keywords": args.keyword} if args.keyword else {}
+
+    # --force: 范围内全部 → pending
     if args.force:
         r = coll_list.update_many(
-            {},
+            scope,
             {"$set": {"detail_status": "pending"},
              "$unset": {"detail_started_at": "",
                         "detail_processed_at": "",
@@ -651,10 +649,10 @@ def main() -> None:
         )
         logger.info(f"--force: 重置 {r.modified_count} 条 → pending")
 
-    # --retry-failed: 仅重置 failed → pending，保留 done
+    # --retry-failed: 范围内 failed → pending
     if args.retry_failed:
         r = coll_list.update_many(
-            {"detail_status": "failed"},
+            {**scope, "detail_status": "failed"},
             {"$set": {"detail_status": "pending"},
              "$unset": {"detail_started_at": "",
                         "detail_processed_at": "",
@@ -667,10 +665,7 @@ def main() -> None:
     if rescued:
         logger.info(f"恢复 {rescued} 条卡在 processing 的孤儿")
 
-    # 构造 query
-    query: dict = {"detail_status": "pending"}
-    if args.keyword:
-        query["keyword"] = args.keyword
+    query = build_pending_query(args.keyword)
 
     total_done = 0
     total_failed = 0
@@ -678,26 +673,20 @@ def main() -> None:
 
     # DrissionPage 自启 headless Chrome（auto_port 强制独立进程）
     # 一个 ChromiumPage 实例 = 一个 Chrome 进程；并发靠多 tab + ThreadPoolExecutor
-    # set_argument('--headless') 用老式 flag (不是 --headless=new),
-    # 绕过 DrissionPage 4.1.1.4 .headless(True) 在 Windows 上 ws 连接失败的 bug,
-    # 实现真 headless 无窗口运行。详见 crawl_1337x_by_key.py 顶部 docstring。
-    options = (ChromiumOptions()
-               # .set_argument("--headless")
-               .auto_port(True))
+    options = ChromiumOptions().auto_port(True)
     browser = ChromiumPage(options)
     logger.info(f"DrissionPage 已启动独立 headless Chrome (address={options.address})")
 
     try:
         batch_idx = 0
         while True:
-            # 分批取
             cursor = coll_list.find(query).sort("_id").limit(args.batch)
             batch = []
             for doc in cursor:
                 if args.limit and (total_processed + len(batch)) >= args.limit:
                     break
                 if args.dry_run:
-                    # Dry-run: 不抢占 status，保留 pending 计数供后续 verification
+                    # dry-run 不抢占 status
                     batch.append(doc)
                 else:
                     claimed = claim_one(coll_list, doc["_id"])
@@ -718,7 +707,6 @@ def main() -> None:
             total_failed += failed
             total_processed += len(batch)
 
-            # 进度日志
             log_line = f"[batch {batch_idx}] done={done} failed={failed} elapsed={elapsed:.1f}s"
             logger.info(log_line)
             (HTML_DIR / "_progress.log").open("a", encoding="utf-8").write(
@@ -731,7 +719,11 @@ def main() -> None:
 
             time.sleep(args.pace)
     finally:
-        # 关闭整个 Chrome（DrissionPage 拥有自己的 Chrome，必须 quit）
+        # 反向置回：本次进程若有 claim 但未完成的 processing 文档，恢复为 pending
+        if not args.dry_run:
+            reverse = rescue_orphaned_processing(coll_list)
+            if reverse:
+                logger.info(f"退出前反向置回 {reverse} 条 processing → pending")
         try:
             browser.quit()
             logger.info("DrissionPage Chrome 已关闭")
@@ -742,7 +734,8 @@ def main() -> None:
         f"完成。done={total_done} failed={total_failed} "
         f"total={total_processed}"
     )
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
