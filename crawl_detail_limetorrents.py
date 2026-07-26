@@ -116,6 +116,7 @@ def extract_imdb_id(imdb_url: str | None) -> str | None:
 # DB 层（Task 5）
 # ============================================================
 from pymongo import ReturnDocument
+from pymongo.errors import DocumentTooLarge
 
 
 def claim_one(coll_list, doc_id: str) -> dict | None:
@@ -491,7 +492,6 @@ def run_one(tab, doc: dict, coll_list, coll_detail, dry_run: bool = False) -> st
     - ParseError       → 不重试，立即 failed
     - 其他异常         → 最多重试 MAX_RETRIES 次（间或 RETRY_BACKOFF）
     """
-    from pymongo.errors import DocumentTooLarge
 
     doc_id = doc["_id"]
     url = doc["detail_url"]

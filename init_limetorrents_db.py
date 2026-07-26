@@ -3,12 +3,12 @@ import sys
 
 from pymongo import ASCENDING, DESCENDING, MongoClient
 
-from crawl_limetorrents import DB_NAME, MONGO_URI
+from crawl_limetorrents import COLL_NAME, DB_NAME, MONGO_URI
 from crawl_detail_limetorrents import COLL_DETAIL
 
 sys.stdout.reconfigure(encoding="utf-8")
 
-COLL_LIST = "bt_info_list"
+COLL_LIST = COLL_NAME
 
 
 def initialize_database(db) -> dict[str, int]:
