@@ -21,7 +21,7 @@ from bs4 import BeautifulSoup
 # 让 import 找到项目根的 crawl_1337x_by_key
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from crawl_limetorrents import (
-    parse_listing, parse_1337x_time, BASE,
+    parse_listing, BASE,
 )
 
 logging.basicConfig(
@@ -128,7 +128,7 @@ def main():
             ok = "✓" if (hv == pv or (f in ("seeds", "leechers") and hv.isdigit() and int(hv) == pv)) else "✗"
             logger.info(f"  {ok} {f:9s} HTML={hv!r:<30} 解析={pv!r}")
         hv_time = html_row["time"]
-        logger.info(f"  ✓ time      HTML={hv_time!r:<30} 解析={it['list_time']!r}(parse_1337x_time 转换)")
+        logger.info(f"  ✓ time      HTML={hv_time!r:<30} 解析={it['list_time']!r}")
 
     logger.info("=" * 60)
     if len(items) == len(rows_html) and not problems:

@@ -133,18 +133,8 @@ def parse_limetorrents_time(
 # 本脚本已不再使用(DrissionPage 用 auto_port 自启)。如果 detail crawler 也迁走,即可删除。
 CDP_URL = "http://127.0.0.1:9222"
 
-# 全局并发设置:与 wrapper 共享同一环境变量名;本脚本是单 key 单进程,
-# 不实际使用此值,仅在启动日志中 echo 以保持 API 一致
-ENV_CONCURRENCY = "CRAWL_1337X_CONCURRENCY"
-
 # 单页之间间隔（秒），礼貌爬取
 PAGE_SLEEP = 1.0
-
-# 子脚本内部重试:失败(超时/CF 拦截/未渲染等)自动再跑,Chrome 每次重新创建
-# (前次失败时的卡死 page 状态不应跨 attempt 保留)。
-# 1 次初始 + 最多 3 次重试 = 最多 4 次尝试。
-MAX_ATTEMPTS = 4
-RETRY_BACKOFF = 5  # 每次尝试前 sleep 秒数
 
 # 断点续爬 checkpoint 目录:每个 (mode, category, keyword) 一个 JSON。
 # 子进程被 wrapper 超时 kill 后,重试可从中断页继续,而不是重头爬(避免大 key 永远超时无进展)。
@@ -238,64 +228,6 @@ def upsert_listing(coll, item: dict) -> bool:
         upsert=True,
     )
     return result.upserted_id is not None
-
-# 1337x 时间格式: "Oct. 21st '22" / "2am Jul. 13th" / "Jul. 29th '24"
-MONTH_MAP = {
-    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
-}
-
-
-def parse_1337x_time(s: str) -> str:
-    """1337x 列表里的时间文本 → 'yyyy-mm-dd hh:mm:ss'。
-
-    支持的形式:
-        'Oct. 21st 22'  → '2022-10-21 00:00:00'
-        '2am Jul. 13th' → '<当前年>-07-13 02:00:00'
-        'Jul. 29th 24'  → '2024-07-29 00:00:00'
-    无法解析时返回空串。
-    """
-    if not s:
-        return ""
-    # 去掉前导时间，如 "2am "、"10pm "
-    s = re.sub(r"^\d{1,2}(?:am|pm)\s+", "", s.strip(), flags=re.IGNORECASE)
-    # 形如 "Oct. 21st '22" 或 "Jul. 29th 24"
-    m = re.match(r"([A-Za-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s*'?(?:(\d{2,4}))?", s)
-    if not m:
-        return ""
-    month_num = MONTH_MAP.get(m.group(1).lower()[:3])
-    if not month_num:
-        return ""
-    day = int(m.group(2))
-    yy_raw = m.group(3)
-    if yy_raw:
-        year = int(yy_raw)
-        if year < 100:
-            year += 2000
-    else:
-        year = datetime.now().year
-    return f"{year:04d}-{month_num:02d}-{day:02d} 00:00:00"
-
-
-def detect_last_page(html: str) -> int:
-    """从分页栏提取最后一页页码。1337x 的分页 DOM：<div class="pagination">...<a href="/search/House/N/">N</a>...</div>"""
-    soup = BeautifulSoup(html, "html.parser")
-    nums = []
-    for a in soup.select("div.pagination a[href]"):
-        m = re.search(r"/search/[^/]+/(\d+)/?", a["href"])
-        if m:
-            nums.append(int(m.group(1)))
-    return max(nums) if nums else 1
-
-
-def has_result_rows(html: str) -> bool:
-    """1337x 页面是否含至少一行结果(table.table-list 里有 tbody tr)。
-
-    用于区分「正常有结果」与「Cloudflare 软墙/未渲染返回的空表格骨架」。
-    仅保留供 1337x 旧路径使用；LimeTorrents 列表判定走 has_result_table()。
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    return bool(soup.select("table.table-list tbody tr"))
 
 
 # ============================================================================
@@ -668,7 +600,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.category = normalize_category(args.category)
     args.search_category = normalize_category(args.search_category, allow_all=True)
     if args.keyword is not None:
-        slugify_keyword(args.keyword)
+        # 立刻原地规范化,后续 build_search_url 拿到的就是 slug,
+        # 避免空格/URL 不安全字符在路径里被二次误判。
+        slug = slugify_keyword(args.keyword)
+        # slugify_keyword 已把连续空白折叠为 "-";若 keyword 内含多个空格,
+        # 这里能立刻捕获 " " 没被折叠的退化结果。
+        assert " " not in slug, f"slug 不应含未折叠空格: {slug!r}"
+        assert slug, "slug 不可为空"
+        args.keyword = slug
     return args
 
 

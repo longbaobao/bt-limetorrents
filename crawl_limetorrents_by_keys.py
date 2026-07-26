@@ -1,15 +1,13 @@
 """
-1337x 多关键词并发抓取 wrapper。
+LimeTorrents 多关键词并发抓取 wrapper。
 
-从 data/keys.txt 读每个 key,subprocess 调用 crawl_1337x_by_key.py 处理,
+从 data/keys.txt 读每个 key,subprocess 调用 crawl_limetorrents.py 处理,
 成功的 key 追加到 data/keys-done.txt(线程锁保护)。
 已 done 的 key 自动跳过,失败的 key 不写 done(下次重试可捡起)。
 
-重试策略: 子脚本 crawl_1337x_by_key.py 内置 run_with_retry() 共享一个
-subprocess,内部最多尝试 MAX_ATTEMPTS 次(每次自启独立 Chrome,避免卡死
-page 状态污染),断点落盘到 data/checkpoints/。wrapper 这里只管并发调度
-+ 单 key 硬性超时兜底(WORKER_TIMEOUT 秒,防止子进程失控)。
-失败重跑 wrapper 即可从中断页续爬,跨多次运行最终爬完大 key。
+重试策略: 子脚本 crawl_limetorrents.py 内不内置重试,失败页直接 returncode 非 0,
+wrapper 用 WORKER_TIMEOUT 兜底(防止子进程失控卡死)。
+失败重跑 wrapper 即可从中断页续爬(checkpoint 由子脚本自己落盘到 data/checkpoints/)。
 
 并发模型:
     -c N   ThreadPoolExecutor(N) 调 N 个 worker subprocess,每个 worker
@@ -42,13 +40,12 @@ SCRIPT = "crawl_limetorrents.py"
 # 断点保留,下次重跑 wrapper 自动从中断页续爬。
 WORKER_TIMEOUT = 600
 
-# 重试策略已移入 crawl_1337x_by_key.py 的 run_with_retry():
-# 共享一个 subprocess,内部最多重试 4 次(每次自启独立 Chrome,避免卡死 page 状态污染),
-# 失败时断点落盘,下次再跑 wrapper 从中断页继续。
+# 重试策略:子脚本内不内置重试,失败直接 returncode 非 0 + 保留 checkpoint,
+# 下次再跑 wrapper 通过 load_checkpoint 从中断页续爬。
 
 # 全局并发设置:环境变量优先,默认 1(纯串行,向后兼容)
 # 范围 [1, 16];CLI --concurrency 可临时覆盖
-ENV_CONCURRENCY = "CRAWL_1337X_CONCURRENCY"
+ENV_CONCURRENCY = "CRAWL_LIMETORRENTS_CONCURRENCY"
 DEFAULT_CONCURRENCY = 1
 MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 16
@@ -110,16 +107,17 @@ def append_done(key: str, lock: threading.Lock) -> None:
 def run_one(key: str) -> tuple[str, int, str]:
     """subprocess 跑单个 key。返回 (key, returncode, stderr_tail)。
 
-    重试逻辑已在子脚本 crawl_1337x_by_key.py 内实现(共享 Chrome 自重启重试,
-    最多 MAX_ATTEMPTS 次)。wrapper 这里只负责:每个 keyword 启一个 subprocess,
-    用 WORKER_TIMEOUT 做硬性兜底(防止子进程失控卡死)。
+    重试逻辑不在子脚本内做:子脚本失败直接 returncode 非 0,checkpoint 保留,
+    下次 wrapper 重跑时由 load_checkpoint 从中断页续爬。wrapper 这里只负责:
+    每个 keyword 启一个 subprocess,用 WORKER_TIMEOUT 做硬性兜底
+    (防止子进程失控卡死)。
 
     stdout 透传到父进程(实时看到子脚本的中文进度),stderr 截留备用(失败时 dump 尾部)。
     """
     args = [sys.executable, SCRIPT, key]
     logger.info(
         f"[开始] {key} pid={os.getpid()} "
-        f"(DrissionPage 子脚本内自启 Chrome + 子脚本内重试 {MAX_ATTEMPTS} 次)"
+        f"(DrissionPage 子脚本内自启 Chrome,失败由 checkpoint 续爬)"
     )
     try:
         # encoding 显式 utf-8:Windows 中文系统默认 GBK 会让中文 logging 崩
