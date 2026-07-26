@@ -36,6 +36,7 @@ from crawl_limetorrents import (
     fetch_with_cf_bypass,
     parse_limetorrents_time,
     parse_result_row,
+    upsert_listing,
 )
 COLL_LIST = "bt_info_list"
 COLL_DETAIL = "bt_info_detail"
@@ -470,6 +471,8 @@ def save_html_cache(detail_url: str, html: str) -> None:
 # ============================================================
 # 编排层（Task 7）
 # ============================================================
+# 导入 + 日志初始化放 _persist_related_listings 之前 —— 该 helper 已通过模块级
+# logger 记录 warning / info，日志必须先就位。
 import argparse
 import time
 import logging
@@ -480,6 +483,57 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+
+def _persist_related_listings(coll_list, parsed: dict) -> int:
+    """把详情页 Related torrents 区解到的每条都 upsert 到 bt_info_list。
+
+    - 复用 crawl_limetorrents.upsert_listing：$setOnInsert 保证不会把已 done/failed
+      的记录状态机重置为 pending。
+    - 每条 related 在构造 item 时填齐 upsert_listing 期望的字段：
+      _id = md5(detail_url);discovery_mode = "related"(走 $addToSet);
+      source = "limetorrents"；keyword 留空触发 set_on_insert["keywords"] = [] 分支。
+    - 单条 related upsert 失败不影响其他 related 条目及主流程（内部 try 隔离）。
+    - 返回成功 upsert 的条数（仅供日志参考）。
+    """
+    related = parsed.get("related_torrents") or []
+    if not related:
+        return 0
+    observed_at = parsed.get("parsed_at") or now_str()
+    success = 0
+    for rel in related:
+        detail_url = rel.get("detail_url") or ""
+        if not detail_url:
+            continue
+        item = {
+            "_id": hashlib.md5(detail_url.encode("utf-8")).hexdigest(),
+            "name": rel.get("name", ""),
+            "detail_url": detail_url,
+            "torrent_url": "",  # parse_related_torrents 不投影 torrent URL
+            "category": rel.get("category", ""),
+            "added_text": rel.get("added_text", ""),
+            "added_at": rel.get("added_at", ""),
+            "size": rel.get("size", ""),
+            "seeders": rel.get("seeders", 0),
+            "leechers": rel.get("leechers", 0),
+            "observed_at": observed_at,
+            "source": "limetorrents",
+            "discovery_mode": "related",
+            "keyword": "",  # 空 → 触发 set_on_insert["keywords"] = [] 分支
+        }
+        try:
+            upsert_listing(coll_list, item)
+            success += 1
+        except Exception as exc:
+            logger.warning(
+                f"related upsert 失败（detail_url={detail_url}）: "
+                f"{type(exc).__name__}: {exc}"
+            )
+    if success:
+        logger.info(
+            f"related_torrents: 成功 upsert {success}/{len(related)} 条到 {COLL_LIST}"
+        )
+    return success
 
 
 def run_one(tab, doc: dict, coll_list, coll_detail, dry_run: bool = False) -> str:
@@ -513,9 +567,15 @@ def run_one(tab, doc: dict, coll_list, coll_detail, dry_run: bool = False) -> st
                     parsed["file_entry_count"],
                     parsed["tracker_count"],
                 )
+                # dry-run 也写 related 到 bt_info_list：手动 dry-run 模拟时
+                # 也需要让二级 URL 进入列表；detail 文档本身不写但 related 走 upsert。
+                _persist_related_listings(coll_list, parsed)
                 return "done"
             coll_detail.replace_one({"_id": parsed["_id"]}, parsed, upsert=True)
             mark_done(coll_list, doc_id)
+            # 主详情持久化 & 状态机 done 之后，再把 Related torrents 灌回列表。
+            # 失败（如 DocumentTooLarge 重抛到这里就走不到）不会触发。
+            _persist_related_listings(coll_list, parsed)
             return "done"
         except DocumentTooLarge as exc:
             last_error = f"DocumentTooLarge: {exc}"
