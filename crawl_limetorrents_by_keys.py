@@ -45,7 +45,7 @@ WORKER_TIMEOUT = 600
 
 # 全局并发设置:环境变量优先,默认 1(纯串行,向后兼容)
 # 范围 [1, 16];CLI --concurrency 可临时覆盖
-CRAWL_LIMETORRENTS_CONCURRENCY = "CRAWL_LIMETORRENTS_CONCURRENCY"
+ENV_CONCURRENCY = "CRAWL_LIMETORRENTS_CONCURRENCY"
 DEFAULT_CONCURRENCY = 1
 MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 16
@@ -54,17 +54,17 @@ _DONE_LOCK = threading.Lock()
 
 def resolve_concurrency() -> int:
     """从环境变量读默认值(若非法回退到 1),CLI --concurrency 会在 argparse 后覆盖。"""
-    raw = os.environ.get(CRAWL_LIMETORRENTS_CONCURRENCY)
+    raw = os.environ.get(ENV_CONCURRENCY)
     if raw is None or raw.strip() == "":
         return DEFAULT_CONCURRENCY
     try:
         v = int(raw)
     except ValueError:
-        logger.warning(f"环境变量 {CRAWL_LIMETORRENTS_CONCURRENCY}={raw!r} 不是合法整数,回退默认 {DEFAULT_CONCURRENCY}")
+        logger.warning(f"环境变量 {ENV_CONCURRENCY}={raw!r} 不是合法整数,回退默认 {DEFAULT_CONCURRENCY}")
         return DEFAULT_CONCURRENCY
     if not (MIN_CONCURRENCY <= v <= MAX_CONCURRENCY):
         logger.warning(
-            f"环境变量 {CRAWL_LIMETORRENTS_CONCURRENCY}={v} 超出范围 [{MIN_CONCURRENCY}, {MAX_CONCURRENCY}],回退默认 {DEFAULT_CONCURRENCY}"
+            f"环境变量 {ENV_CONCURRENCY}={v} 超出范围 [{MIN_CONCURRENCY}, {MAX_CONCURRENCY}],回退默认 {DEFAULT_CONCURRENCY}"
         )
         return DEFAULT_CONCURRENCY
     return v
@@ -159,14 +159,14 @@ def main(argv: list[str] | None = None) -> int:
         "-c", "--concurrency", type=int, default=resolve_concurrency(), choices=range(MIN_CONCURRENCY, MAX_CONCURRENCY + 1), metavar="N",
         help=(
             f"并发 worker 数(范围 [{MIN_CONCURRENCY}, {MAX_CONCURRENCY}],默认读环境变量"
-            f" {CRAWL_LIMETORRENTS_CONCURRENCY}={DEFAULT_CONCURRENCY};每个 worker 由 DrissionPage 子脚本自启独立 Chrome)"
+            f" {ENV_CONCURRENCY}={DEFAULT_CONCURRENCY};每个 worker 由 DrissionPage 子脚本自启独立 Chrome)"
         ),
     )
     args = parser.parse_args(argv)
     concurrency: int = args.concurrency
-    env_val = os.environ.get(CRAWL_LIMETORRENTS_CONCURRENCY)
+    env_val = os.environ.get(ENV_CONCURRENCY)
     if env_val and env_val.strip():
-        logger.info(f"全局并发设置:环境变量 {CRAWL_LIMETORRENTS_CONCURRENCY}={env_val}(本次实际并发={concurrency})")
+        logger.info(f"全局并发设置:环境变量 {ENV_CONCURRENCY}={env_val}(本次实际并发={concurrency})")
 
     keys = load_keys()
     done = load_done()
