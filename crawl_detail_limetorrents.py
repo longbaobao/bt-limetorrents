@@ -20,8 +20,8 @@ from bs4 import BeautifulSoup
 from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.errors import ElementNotFoundError, PageDisconnectedError
 
-# 复用 crawl_1337x 共享常量（兼容旧名 / 新名 crawl_1337x_by_key）
-from crawl_1337x_by_key import MONGO_URI, DB_NAME, fetch_with_cf_bypass
+# 复用 crawl_limetorrents 共享常量（兼容旧名 / 新名 crawl_1337x_by_key）
+from crawl_limetorrents import MONGO_URI, DB_NAME, fetch_with_cf_bypass
 COLL_LIST = "bt_info_list"
 COLL_DETAIL = "bt_info_detail"
 

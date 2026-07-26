@@ -2,7 +2,7 @@
 import sys
 sys.path.insert(0, ".")
 from pathlib import Path
-from crawl_detail_1337x import html_cache_path
+from crawl_detail_limetorrents import html_cache_path
 
 
 def test_returns_path_with_md5_and_html():

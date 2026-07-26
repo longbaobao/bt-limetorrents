@@ -1,7 +1,7 @@
 """测试 extract_imdb_id：从 imdb URL 提取 ttXXXXXXX。"""
 import sys
 sys.path.insert(0, ".")
-from crawl_detail_1337x import extract_imdb_id
+from crawl_detail_limetorrents import extract_imdb_id
 
 
 def test_normal():

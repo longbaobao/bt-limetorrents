@@ -8,7 +8,7 @@ from datetime import datetime
 from pymongo import MongoClient
 
 sys.path.insert(0, ".")
-from crawl_1337x import parse_1337x_time, DB_NAME, COLL_NAME, MONGO_URI
+from crawl_limetorrents import parse_1337x_time, DB_NAME, COLL_NAME, MONGO_URI
 
 
 def main():

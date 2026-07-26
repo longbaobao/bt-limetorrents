@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 KEYS_FILE = Path("data/keys.txt")
 DONE_FILE = Path("data/keys-done.txt")
-SCRIPT = "crawl_1337x_by_key.py"
+SCRIPT = "crawl_limetorrents.py"
 # 单 key 子进程的硬性兜底超时(含子脚本内全部重试时间,并非每次重试的独立超时)。
 # 子脚本重试时退出码非 0(超时/CF 拦截/解析失败)会被 wrapper 标记为不写 done、
 # 断点保留,下次重跑 wrapper 自动从中断页续爬。

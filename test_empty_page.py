@@ -8,7 +8,7 @@
 import sys
 sys.stdout.reconfigure(encoding="utf-8")
 
-import crawl_1337x_by_key as ck
+import crawl_limetorrents as ck
 
 failures = []
 

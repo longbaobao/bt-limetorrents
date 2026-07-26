@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 
 # 让 import 找到项目根的 crawl_1337x_by_key
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from crawl_1337x_by_key import (
+from crawl_limetorrents import (
     parse_listing, parse_1337x_time, BASE,
 )
 

@@ -17,7 +17,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 from DrissionPage import ChromiumPage, ChromiumOptions
 from pymongo import MongoClient
 
-from crawl_detail_1337x import (
+from crawl_detail_limetorrents import (
     MONGO_URI,
     DB_NAME,
     COLL_LIST,

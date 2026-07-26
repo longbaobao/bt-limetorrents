@@ -2,7 +2,7 @@
 import pytest
 import sys
 sys.path.insert(0, ".")
-from crawl_detail_1337x import parse_detail, ParseError
+from crawl_detail_limetorrents import parse_detail, ParseError
 from conftest import fixture
 
 

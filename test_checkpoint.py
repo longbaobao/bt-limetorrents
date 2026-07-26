@@ -8,7 +8,7 @@ sys.stdout.reconfigure(encoding="utf-8")
 import tempfile
 from pathlib import Path
 
-import crawl_1337x_by_key as ck
+import crawl_limetorrents as ck
 
 failures = []
 

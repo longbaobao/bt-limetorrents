@@ -2,7 +2,7 @@
 from datetime import datetime
 import sys
 sys.path.insert(0, ".")
-from crawl_detail_1337x import parse_relative_time
+from crawl_detail_limetorrents import parse_relative_time
 
 
 REF = datetime(2026, 7, 21, 19, 0, 0)
