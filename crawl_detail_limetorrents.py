@@ -1,5 +1,5 @@
 """
-1337x 详情页爬虫：从 bt_info_list 取 detail_url，抓 HTML 落本地，解析入库。
+LimeTorrents 详情页爬虫：从 bt_info_list 取 detail_url，抓 HTML 落本地，解析入库。
 
 DrissionPage 自启 headless Chrome（auto_port 强制独立进程），不接管外部 9222 实例。
 - 并发模型：ThreadPoolExecutor(max_workers=concurrency)，每个 worker 一个独立 tab
@@ -14,18 +14,25 @@ import hashlib
 import time as _time
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 from threading import Semaphore
 from bs4 import BeautifulSoup
 from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.errors import ElementNotFoundError, PageDisconnectedError
 
-# 复用 crawl_limetorrents 共享常量（兼容旧名 / 新名 crawl_1337x_by_key）
-from crawl_limetorrents import MONGO_URI, DB_NAME, fetch_with_cf_bypass
+# 复用 crawl_limetorrents 共享常量与解析器（详见 crawl_limetorrents.py）
+from crawl_limetorrents import (
+    BASE,
+    DB_NAME,
+    MONGO_URI,
+    fetch_with_cf_bypass,
+    parse_limetorrents_time,
+)
 COLL_LIST = "bt_info_list"
 COLL_DETAIL = "bt_info_detail"
 
-HTML_DIR = Path("data/html")
+HTML_DIR = Path("data/html/limetorrents")
 
 BATCH = 100
 MAX_RETRIES = 3
@@ -157,120 +164,143 @@ def _as_int(value: str) -> int:
     return int(normalized) if normalized.isdigit() else 0
 
 
-def parse_detail(html: str, detail_url: str) -> dict:
-    """将 1337x 详情页 HTML 解析为 bt_info_detail 文档。"""
-    soup = BeautifulSoup(html, "html.parser")
+# ============================================================
+# LimeTorrents 详情解析（Task 6）：基本信息 / Trackers
+# ============================================================
 
-    if not soup.select_one("div.torrent-detail, div.box-info-heading"):
-        raise ParseError(f"详情页结构无法识别: {detail_url}")
 
-    heading = soup.select_one("div.box-info-heading h1, h1")
-    name = _text(heading)
-    title_element = soup.select_one("div.torrent-detail-info h3 a, div.torrent-detail-info h3")
-    title = (_text(title_element) or name).upper()
+def find_table_after_heading(soup, heading_text: str, table_class: str | None = None):
+    """在 soup 中查找 `<h2>` 文本严格匹配 heading_text 的下一个 table。
 
-    meta = {}
-    for row in soup.select("ul.list li"):
-        key_element = row.select_one("strong")
-        value_element = row.select_one("span")
-        if key_element and value_element:
-            key = _text(key_element).rstrip(":").strip().lower()
-            meta[key] = _text(value_element)
-
-    ref_now = datetime.now()
-    date_uploaded = parse_relative_time(meta.get("date uploaded", ""), ref_now)
-    last_checked = parse_relative_time(meta.get("last checked", ""), ref_now)
-
-    genre = " ".join(
-        filter(None, (_text(element) for element in soup.select("div.torrent-category span")))
-    ).upper()
-    tags = list(
-        filter(None, (_text(link) for link in soup.select("ul.category-name li a")))
-    )
-
-    infohash_box = soup.select_one("div.infohash-box")
-    match = re.search(
-        r"INFOHASH\s*:\s*([A-Fa-f0-9]{32,40})",
-        _text(infohash_box),
-        re.IGNORECASE,
-    )
-    info_hash = match.group(1) if match else ""
-
-    resource_links = {}
-    magnet_link = soup.select_one("a[href^='magnet:']")
-    if magnet_link and magnet_link.get("href"):
-        resource_links["magnet"] = magnet_link["href"]
-
-    for link_name, host in (
-        ("itorrents", "itorrents.org"),
-        ("torrage", "torrage.info"),
-        ("btcache", "btcache.me"),
-    ):
-        link = soup.select_one(f"a[href*='{host}']")
-        if link and link.get("href"):
-            resource_links[link_name] = link["href"]
-
-    stream_link = soup.select_one(
-        "div.torrent-detail-info a[href*='play'], "
-        "div.torrent-detail-info a[href*='stream']"
-    )
-    if stream_link and stream_link.get("href"):
-        resource_links["stream"] = stream_link["href"]
-
-    imdb_link = soup.select_one("a[href*='imdb.com/title/']")
-    imdb_href = imdb_link.get("href") if imdb_link else None
-    imdb_url = imdb_href if isinstance(imdb_href, str) else None
-
-    cover = soup.select_one("div.torrent-image img, img.poster")
-    cover_url = cover["src"] if cover and cover.get("src") else None
-
-    description_element = soup.select_one("div.torrent-detail-info .content-row p, div#description")
-    description = _text(description_element)
-
-    rating = None
-    rating_element = soup.select_one("div.torrent-rating")
-    if rating_element:
-        try:
-            rating = int(float(_text(rating_element)))
-        except ValueError:
-            pass
-
-    related_sites = []
-    for link in soup.select("div#description a[href^='http']"):
-        href = link.get("href", "")
-        if "imdb.com" in href or "1337x.to" in href:
+    - 多个匹配 `<h2>` 时返回第一个;
+    - 在匹配 h2 后到下一个 h2 之间定位首个满足 class 过滤的 table;
+    - 未找到返回 None。
+    """
+    for heading in soup.select("h2"):
+        if heading.get_text(" ", strip=True).lower() != heading_text.lower():
             continue
-        link_name = _text(link)
-        if link_name and href:
-            related_sites.append({"name": link_name, "url": href})
+        for element in heading.find_all_next():
+            if element is not heading and element.name == "h2":
+                break
+            if element.name != "table":
+                continue
+            if table_class and table_class not in element.get("class", []):
+                continue
+            return element
+    return None
 
+
+def parse_basic_info(soup, ref_now: datetime) -> dict:
+    """解析 `div.torrentinfo > table` 抽取基本信息。
+
+    返回 dict：info_hash / added_text / added_at / category / total_size / stream。
+    缺基本信息表抛 ParseError("详情页缺少基本信息表")。
+    """
+    table = soup.select_one("div.torrentinfo > table")
+    if table is None:
+        raise ParseError("详情页缺少基本信息表")
+    values = {}
+    links = {}
+    for row in table.select("tr"):
+        cells = row.select("td")
+        if len(cells) < 2:
+            continue
+        key = cells[0].get_text(" ", strip=True).rstrip(":").strip().lower()
+        values[key] = cells[1].get_text(" ", strip=True)
+        link = cells[1].select_one("a[href]")
+        if link:
+            links[key] = urljoin(BASE, link["href"])
+    added_raw = values.get("torrent added", "")
+    category_match = re.search(r"\bin\s+(.+)$", added_raw, re.IGNORECASE)
     return {
-        "_id": hashlib.md5(detail_url.encode()).hexdigest(),
+        "info_hash": values.get("torrent hash", "").strip(),
+        "added_text": added_raw,
+        "added_at": parse_limetorrents_time(added_raw, ref_now),
+        "category": category_match.group(1).strip() if category_match else "",
+        "total_size": values.get("torrent size", ""),
+        "stream": links.get("stream", ""),
+    }
+
+
+def parse_trackers(soup, ref_now: datetime) -> list[dict]:
+    """解析 `<h2>Trackers List</h2>` 后的 `table.table3`。
+
+    每行 5 列：URL / last_check_text / last_checked_at / status / seeders / leechers。
+    表头行(<th>)不参与解析(selects `td` 自然跳过);缺表则返回空列表。
+    """
+    table = find_table_after_heading(soup, "Trackers List", "table3")
+    if table is None:
+        return []
+    trackers = []
+    for row in table.select("tr"):
+        cells = row.select("td")
+        if len(cells) != 5:
+            continue
+        trackers.append({
+            "url": cells[0].get_text(" ", strip=True),
+            "last_check_text": cells[1].get_text(" ", strip=True),
+            "last_checked_at": parse_limetorrents_time(
+                cells[1].get_text(" ", strip=True),
+                ref_now,
+            ),
+            "status": cells[2].get_text(" ", strip=True).lower(),
+            "seeders": _as_int(cells[3].get_text(strip=True)),
+            "leechers": _as_int(cells[4].get_text(strip=True)),
+        })
+    return trackers
+
+
+def parse_detail(
+    html: str,
+    detail_url: str,
+    ref_now: datetime | None = None,
+) -> dict:
+    """将 LimeTorrents 详情页 HTML 解析为 bt_info_detail 文档。
+
+    第一版:基本信息 + magnet/.torrent/stream 资源链接 + trackers;留白
+    (files / related_torrents / comments_count) 留给 Task 7 填充。
+    """
+    ref_now = ref_now or datetime.now()
+    soup = BeautifulSoup(html, "html.parser")
+    if soup.select_one("div.torrentinfo") is None:
+        raise ParseError(f"详情页结构无法识别: {detail_url}")
+    heading = soup.select_one("h1")
+    name = heading.get_text(" ", strip=True) if heading else ""
+    basic = parse_basic_info(soup, ref_now)
+    if not name or not basic["info_hash"]:
+        raise ParseError(f"详情页缺少核心字段: {detail_url}")
+
+    magnet = soup.select_one("div.downloadarea a[href^='magnet:']")
+    torrent = soup.select_one("div.downloadarea a[href*='.torrent']")
+    resources = {
+        "magnet": magnet.get("href", "") if magnet else "",
+        "torrent": urljoin(BASE, torrent.get("href", "")) if torrent else "",
+        "stream": basic.pop("stream"),
+    }
+    trackers = parse_trackers(soup, ref_now)
+    return {
+        "_id": hashlib.md5(detail_url.encode("utf-8")).hexdigest(),
         "detail_url": detail_url,
         "name": name,
-        "category": meta.get("category", ""),
-        "type": meta.get("type", ""),
-        "language": meta.get("language", ""),
-        "total_size": meta.get("total size", ""),
-        "uploaded_by": meta.get("uploaded by", ""),
-        "downloads": _as_int(meta.get("downloads", "")),
-        "last_checked": last_checked,
-        "date_uploaded": date_uploaded,
-        "seeders": _as_int(meta.get("seeders", "")),
-        "leechers": _as_int(meta.get("leechers", "")),
-        "resource_links": resource_links,
-        "cover_url": cover_url,
-        "title": title,
-        "genre": genre,
-        "description": description,
-        "rating": rating,
-        "tags": tags,
-        "info_hash": info_hash,
-        "imdb_url": imdb_url,
-        "imdb_id": extract_imdb_id(imdb_url),
-        "related_sites": related_sites,
-        "c_time": now_str(),
-        "source": "1337x",
+        **basic,
+        "meta_description": (
+            soup.select_one("meta[name='description']").get("content", "")
+            if soup.select_one("meta[name='description']")
+            else ""
+        ),
+        "resource_links": resources,
+        "trackers": trackers,
+        "tracker_count": len(trackers),
+        "successful_tracker_count": sum(t["status"] == "success" for t in trackers),
+        "failed_tracker_count": sum(t["status"] == "failed" for t in trackers),
+        "files": [],
+        "declared_file_count": 0,
+        "file_entry_count": 0,
+        "related_torrents": [],
+        "comments_count": 0,
+        "html_cache_path": str(html_cache_path(detail_url)).replace("\\", "/"),
+        "source": "limetorrents",
+        "parsed_at": ref_now.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 

@@ -1,4 +1,4 @@
-"""测试 html_cache_path：data/html/<md5>.html。"""
+"""测试 html_cache_path：data/html/limetorrents/<md5>.html。"""
 import sys
 sys.path.insert(0, ".")
 from pathlib import Path
@@ -6,10 +6,10 @@ from crawl_detail_limetorrents import html_cache_path
 
 
 def test_returns_path_with_md5_and_html():
-    url = "https://1337x.to/torrent/5006555/The-Night-House/"
+    url = "https://www.limetorrents.fun/St-Vincent-torrent-19859670.html"
     p = html_cache_path(url)
     assert isinstance(p, Path)
-    assert p.parent.name == "html"
+    assert p.parent.name == "limetorrents"
     assert p.suffix == ".html"
     # md5 hex is 32 chars
     assert len(p.stem) == 32
@@ -17,7 +17,7 @@ def test_returns_path_with_md5_and_html():
 
 def test_deterministic():
     """同一 URL 多次调用返回相同路径。"""
-    url = "https://1337x.to/torrent/123/"
+    url = "https://www.limetorrents.fun/torrent/123/"
     assert html_cache_path(url) == html_cache_path(url)
 
 
