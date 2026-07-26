@@ -490,9 +490,12 @@ def _persist_related_listings(coll_list, parsed: dict) -> int:
 
     - 复用 crawl_limetorrents.upsert_listing：$setOnInsert 保证不会把已 done/failed
       的记录状态机重置为 pending。
-    - 每条 related 在构造 item 时填齐 upsert_listing 期望的字段：
-      _id = md5(detail_url);discovery_mode = "related"(走 $addToSet);
-      source = "limetorrents"；keyword 留空触发 set_on_insert["keywords"] = [] 分支。
+    - 每条 related 在构造 item 时填齐简报字段契约：
+      _id = md5(detail_url); detail_url; torrent_url=""; name; category;
+      added_text; added_at; size; seeders; leechers; observed_at;
+      source = "limetorrents"; discovery_mode = "related";
+      keyword = "" (upsert_listing 兼容路径,空 → $setOnInsert["keywords"]=[]);
+      keywords = [] (简报字段契约,显式空数组)。
     - 单条 related upsert 失败不影响其他 related 条目及主流程（内部 try 隔离）。
     - 返回成功 upsert 的条数（仅供日志参考）。
     """
@@ -506,6 +509,7 @@ def _persist_related_listings(coll_list, parsed: dict) -> int:
         if not detail_url:
             continue
         item = {
+            # ---- 简报字段契约 ----
             "_id": hashlib.md5(detail_url.encode("utf-8")).hexdigest(),
             "name": rel.get("name", ""),
             "detail_url": detail_url,
@@ -519,7 +523,9 @@ def _persist_related_listings(coll_list, parsed: dict) -> int:
             "observed_at": observed_at,
             "source": "limetorrents",
             "discovery_mode": "related",
-            "keyword": "",  # 空 → 触发 set_on_insert["keywords"] = [] 分支
+            # ---- related 模式不带 CLI keyword ----
+            "keyword": "",      # upsert_listing 兼容路径: 空 → $setOnInsert["keywords"]=[]
+            "keywords": [],     # 简报字段契约: 显式标记此 related 无关键词
         }
         try:
             upsert_listing(coll_list, item)

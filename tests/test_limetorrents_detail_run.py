@@ -236,3 +236,84 @@ def test_run_one_document_too_large_does_not_upsert_related(monkeypatch):
     assert all(
         not upsert for (_, _, upsert) in coll_list.calls
     ), "DocumentTooLarge 失败路径下不应有 related upsert"
+
+
+# ============================================================
+# Task 11 fix：单条 related upsert 异常隔离
+# ============================================================
+
+def test_related_upsert_isolated_when_one_raises(monkeypatch):
+    """单条 related upsert 抛异常 → 其他 related 仍写入 + 主流程仍 done + mark_failed 未触发。
+
+    模拟 Mongo 短暂不可用 / 单条 related 字段异常 → 必须隔离,不影响
+    run_one 返回值与主 doc 状态机。helper 内部已有 try/except 包裹每条
+    upsert_listing 调用,本测试用 monkeypatch 选择性打爆其中一条,验证:
+      - 其他 related 仍走完 upsert 路径
+      - 主 doc 的 mark_done 仍被调用
+      - mark_failed 未被触发
+      - run_one 返回 "done"
+    """
+    parsed = parse_detail(
+        fixture("limetorrents_detail_st_vincent.html"),
+        DETAIL_URL,
+        REF,
+    )
+    related_count = len(parsed["related_torrents"])
+    assert related_count >= 5, "fixture 应至少有 5 条 related 用以测试隔离"
+
+    monkeypatch.setattr(detail, "fetch_one", lambda tab, url: "<html></html>")
+    monkeypatch.setattr(detail, "save_html_cache", lambda url, html: None)
+    monkeypatch.setattr(detail, "parse_detail", lambda html, url: parsed)
+
+    # 选中间那条 related 让 upsert_listing 抛 RuntimeError
+    boom_index = 2
+    boom_url = parsed["related_torrents"][boom_index]["detail_url"]
+    boom_target_id = _related_id(boom_url)
+    original_upsert = detail.upsert_listing
+
+    def selective_boom(coll, item):
+        if item.get("detail_url") == boom_url:
+            raise RuntimeError("boom")
+        return original_upsert(coll, item)
+
+    monkeypatch.setattr(detail, "upsert_listing", selective_boom)
+
+    coll_list = FakeList()
+    coll_detail = FakeDetailOK()
+    result = detail.run_one(
+        FakeTab(),
+        {"_id": "main-id", "name": parsed["name"], "detail_url": DETAIL_URL},
+        coll_list,
+        coll_detail,
+    )
+
+    # 1. run_one 仍返回 "done"(helper 内部异常隔离不影响主流程)
+    assert result == "done", (
+        f"单条 related upsert 异常应被隔离,run_one 仍应 done,实际 {result!r}"
+    )
+
+    # 2. coll_list.update_one 总调用次数 = 1 (mark_done) + (related_count - 1) 成功 upsert
+    upsert_calls = [
+        (f, u) for (f, u, upsert) in coll_list.calls if upsert
+    ]
+    assert len(upsert_calls) == related_count - 1, (
+        f"期望 {related_count - 1} 次成功 related upsert"
+        f"(boom 跳过 1 条,共 {related_count}),实际 {len(upsert_calls)}"
+    )
+    # boom 那条 related 的 _id 不应在 upsert_calls 里
+    upserted_ids = {f["_id"] for (f, _) in upsert_calls}
+    assert boom_target_id not in upserted_ids, (
+        f"boom related 不应被 upsert,却在 upsert_calls 里找到 _id={boom_target_id}"
+    )
+
+    # 3. mark_done 被调用(主 doc 的 _id 上写 done)
+    mark_done_calls = [
+        u for (_, u, upsert) in coll_list.calls
+        if not upsert and u.get("$set", {}).get("detail_status") == "done"
+    ]
+    assert mark_done_calls, "mark_done 必须被调用"
+
+    # 4. mark_failed 未被调用(FakeList.failed 仍为 None)
+    assert coll_list.failed is None, (
+        f"mark_failed 不应被触发,但 coll_list.failed={coll_list.failed!r}"
+    )
