@@ -4,63 +4,123 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-基于 Selenium + Chrome 的网盘资源爬虫。通过夸克搜索结果抓取各类网盘分享链接（阿里云盘、夸克、百度、迅雷、189、118、蓝奏、115），解析后写入 MongoDB。配套定时任务按每天 4 个时段运行。
+基于 DrissionPage + headless Chrome 的 LimeTorrents 种子爬虫。通过 LimeTorrents 分类浏览页与关键词搜索页抓取种子条目（标题、分类、大小、做种/下载数、添加时间、详情链接、torrent 直链），再进入详情页抓取 info_hash、magnet、torrent 直链、文件树、Trackers、相关种子与评论数。列表与详情分别写入 MongoDB 的两个集合,支持 checkpoint 续跑、幂等 upsert、CAS 状态机和 dry-run。DrissionPage 自启独立 headless Chrome（每个子脚本独占 user-data-dir 与端口），不接管外部浏览器。
 
 ## 运行
 
-无打包、无构建系统、无测试、无 linter。直接以脚本方式执行：
+无打包、无构建系统。直接以脚本方式执行。**所有 Python 命令使用 `.venv/Scripts/python.exe`**（Windows 下 Python 3.11 已装依赖）。
 
-- `python main_01.py` — 抓取主入口。`__main__` 已写死调用 5 个关键词搜索（aliyundrive / alipan / pan.quark / pan.baidu / pan.xunlei / 123pan）。
-- `python schedule_job.py` — 启动 7:00 / 12:00 / 16:00 / 21:00 的定时调度器（依赖 `schedule` 库）。
-- `python parse_index.py` — 离线解析 `data/index.html`（注意：脚本里写死路径 `D:/workspace/project/awesome-spider-python/pan-spider-quark-search/data/index.html`，需要修改后再跑）。
-- `test_02.py` — 空文件。
+最小命令示例：
 
-依赖见 `requirements.txt`（`uv pip install -r requirements.txt`）。ChromeDriver 路径硬编码在 `main_01.py:394`。
+```text
+.venv/Scripts/python.exe crawl_limetorrents.py --category Movies
+.venv/Scripts/python.exe crawl_limetorrents.py --keyword "St Vincent"
+.venv/Scripts/python.exe crawl_limetorrents_by_keys.py --search-category all
+.venv/Scripts/python.exe crawl_detail_limetorrents.py --limit 10 --concurrency 2
+.venv/Scripts/python.exe init_limetorrents_db.py
+```
+
+其他常见调用：
+
+- `.venv/Scripts/python.exe crawl_limetorrents.py --category Music --start-page 1 --max-pages 3` — 浏览指定分类前 3 页。
+- `.venv/Scripts/python.exe crawl_limetorrents.py --keyword "St Vincent" --max-pages 2` — 关键词搜索前 2 页（已存在的 URL 不重复插入）。
+- `.venv/Scripts/python.exe crawl_limetorrents.py --keyword "House" --search-category tv-shows` — 限定搜索分类。
+- `.venv/Scripts/python.exe crawl_detail_limetorrents.py --keyword "St-Vincent" --limit 20` — 仅处理指定 keyword 的详情。
+- `.venv/Scripts/python.exe crawl_detail_limetorrents.py --retry-failed` — 把 failed → pending 重抓。
+- `.venv/Scripts/python.exe crawl_detail_limetorrents.py --force --concurrency 4` — 强制重跑所有记录（无视 status）。
+- `.venv/Scripts/python.exe crawl_detail_limetorrents.py --keyword "X" --limit 1 --dry-run` — 解析不写库,验证结构。
+- `.venv/Scripts/python.exe -m pytest -v` — 跑全套离线 pytest。
+- `.venv/Scripts/python.exe -m compileall -q crawl_limetorrents.py crawl_limetorrents_by_keys.py crawl_detail_limetorrents.py init_limetorrents_db.py tests` — 编译检查。
+
+依赖见 `requirements.txt`（`uv pip install -r requirements.txt`）。`DrissionPage` 4.1.1.4 用了 `auto_port(True)` 强制独立 Chrome 进程,绕开 Windows 上 `.headless(True)` 不监听 ws endpoint 的 bug。
 
 ## 架构与数据流
 
 ```
-main_01.search_by_keyword(keyword)
+crawl_limetorrents.main(argv)               # 列表入口(浏览 / 搜索 双模式)
     │
-    ├─ start_chrome_with_debugging()        # 启动 Chrome 调试模式 (port 9222)
-    ├─ scroll_page_slowly()                  # 缓慢滚动加载搜索结果
-    ├─ parse_index_html(html)                # BeautifulSoup 解析搜索结果列表
-    │     → 每条结果: 标题/URL/描述/来源/日期
+    ├─ parse_args(argv)                       # CLI 解析(--keyword 决定 search / browse)
+    ├─ load_checkpoint(mode, category, keyword)  # 读 data/checkpoints/limetorrents-<md5>.json
+    ├─ build_browse_url(category, page)       # /browse-torrents/<Cat>/date/<page>/
+    ├─ build_search_url(category, kw, page)   # /search/<cat-or-all>/<slug>/
     │
-    ├─ 对每条结果:
-    │     ├─ RegexUtils.parse_txt_multi(desc)        # 从描述中提网盘链接
-    │     └─ spider_inner_html(driver, result_url)   # 跳进原文再抓一次
-    │           ├─ data/processed_urls.txt 去重
-    │           └─ RegexUtils.parse_html_multi(html) # 从原文 HTML 中提
+    ├─ ChromiumPage(ChromiumOptions().auto_port(True))   # DrissionPage 自启 headless Chrome
     │
-    └─ save_url_objects(url_objects, client="quark_search")
-          └─ 写入 MongoDB: pan_spider_db.ResToDoItem
+    ├─ 循环:
+    │     ├─ fetch_with_cf_bypass(tab, url, "css:table.table2", max_wait=45)
+    │     │     # 处理 Cloudflare 5秒盾(请稍候 / Just a moment / cf_chl_opt …)
+    │     ├─ has_result_table(html)           # 确认页面含 table.table2 才推进
+    │     ├─ parse_listing(html, mode, category, keyword)   # 解析结果行(忽略 table.table3)
+    │     ├─ detect_next_url(html, url)       # 找 "next page" 链接(用实际 href 拼接)
+    │     └─ upsert_listing(coll, item)       # 幂等 upsert(by _id=md5(detail_url))
+    │
+    └─ save_checkpoint / clear_checkpoint     # 原子写 checkpoint,完成后清理
+
+crawl_limetorrents_by_keys.main(argv)        # 多 key 并发 wrapper
+    │
+    ├─ load_keys()  ← data/keys.txt
+    ├─ load_done()  ← data/keys-done.txt
+    ├─ ThreadPoolExecutor(concurrency).submit(run_one, key)
+    │     └─ subprocess.run(["crawl_limetorrents.py", "--keyword", key, ...])
+    └─ append_done(key) on rc=0               # 失败不写 done → 下次续跑
+
+crawl_detail_limetorrents.main(argv)         # 详情入口
+    │
+    ├─ parse_args(argv)                       # --limit / --concurrency / --dry-run / --force / --retry-failed
+    ├─ rescue_orphaned_processing()           # 启动时把卡 processing 的孤儿恢复为 pending
+    ├─ build_pending_query(keyword)           # 默认 detail_status=pending
+    │
+    ├─ 循环:
+    │     ├─ claim_one → CAS 把 pending → processing
+    │     ├─ run_one(tab, doc, ..., dry_run):
+    │     │     ├─ fetch_one(tab, url)         # CSS 目标:div.torrentinfo
+    │     │     ├─ save_html_cache(url, html)  # data/html/limetorrents/<md5>.html
+    │     │     ├─ parse_detail(html, url)
+    │     │     │     ├─ parse_basic_info   # info_hash / added_at / category / total_size / stream
+    │     │     │     ├─ parse_trackers    # table3 (Trackers List)
+    │     │     │     ├─ parse_files       # .fileline + 目录栈 → (entries, declared_count)
+    │     │     │     ├─ parse_related_torrents / parse_comments_count
+    │     │     └─ upsert_detail(coll_detail, parsed)
+    │     ├─ mark_done(doc_id) | mark_failed(doc_id, error)
+    │     └─ DocumentTooLarge → 立即 failed,文件不截断
+    │
+    └─ 退出前 reverse rescue_orphaned_processing() → 本次未完成的 processing 回滚为 pending
+
+init_limetorrents_db.main()                  # 一次性建库 + 索引(可重跑)
+    └─ bt_info_list 补齐 detail_status 字段 + 4 个索引
+    └─ bt_info_detail 建 detail_url(unique) + info_hash 索引
 ```
-
-`RegexUtils.py` 是核心工具集，每个网盘厂商独立一个解析类（`AliYunPanRegexUtils` / `QuarkRegexUtils` / `DupanRegexUtils` / `XunLeiPanRegexUtils` / `LanZouPanRegexUtils` / `Pan118RegexUtils` / `Pan189RegexUtils` / `Pan115RegexUtils`），每个类提供 `has_valid_url` / `parse_txt_url_multi` / `parse_txt_url_and_pwd_multi`（参数形式 `?pwd=`）/ `parse_txt_url_and_pwd_split_multi`（"密码：" 分隔形式）/ `parse_txt_multi`（综合，去重并合并密码）。
-
-`RegexUtils.parse_txt_multi` 是统一入口，依次调用 8 个厂商的 `parse_txt_multi` 并合并结果。`RegexUtils.parse_html_multi` 在此基础上再解析 HTML `<title>` / `<meta keywords>` / `<meta description>` 填到 `orgT` / `orgK` / `orgD`。
-
-`RegexUtils.get_pan_url_by_pname(pname, surl)` 是反向操作：根据 `pname` 拼接完整 URL。新增厂商必须同时扩展这里。
 
 ## 关键约定
 
-- **网盘厂商代码 (`pname`)**：严格使用以下常量 — `aliyp` / `quark` / `dupan` / `xunlei` / `189` / `118` / `lanzou` / `115`。出现在 Regex 工具类、`get_share_valid_status` 分支判断、`save_url_objects` 主流程中，**任何新增或修改必须三处一致**。
-- **资源指纹**：`save_url_objects` 用 `md5("123" + url)` 作为 `_id`，`md5(url)` 作为 `md5` 字段，加前缀 `"123"` 是历史遗留（避免和别的集合冲突），不要去掉。
-- **去重**：跨进程去重走 `data/processed_urls.txt`（每行一个 URL），`spider_inner_html` 进入页面前先查再追加。
-- **忽略 `pwd == "dany"`**：在 `save_url_objects` 里 hardcode 跳过，不要去掉。
-- **HTML 解析的搜索结果选择器**：`section.sc.sc_structure_template_normal`（夸克 DOM 结构），改版会失效。
-- **搜索 URL 时间过滤 (`tbs`)**：`d`=天 / `w`=周 / `m`=月 / `y`=年，对应 `{"time":"4" / "3" / "2" / "1"}`。
-- **MongoDB**：`mongodb://localhost:27017/` → DB `pan_spider_db` → collection `ResToDoItem`。`ResToDoItem` 字段约定：`_id` / `md5` / `url` / `pwd` / `pName` / `client` / `cTime` / `orgUrl` / `orgT` / `orgK` / `orgD` / `remark`。
-- **Chrome 调试端口**：9222，用户数据目录 `~/.chrome_debug_profile`，Chrome 路径硬编码 `C:/Program Files/Google/Chrome/Application/chrome.exe`，ChromeDriver 路径硬编码 `H:\services\chromedriver\132.0.6834.83\chromedriver.exe`。本机配置差异需直接改 `main_01.py`。
+- **数据指纹**：列表与详情共用 `md5(detail_url)` 作为 `_id`。详情也走 `_id=md5(detail_url)`,所以同一 URL 的详情 `replace_one(..., upsert=True)` 自动覆盖(幂等)。
+- **跨模式去重**:`upsert_listing` 用 `$addToSet` 累积 `keywords` 与 `discovery_modes`,同一详情被多 key / 多 mode 发现不重复插入。已 done 的详情不会被列表重抓重置为 pending(`upsert` 不会改 `first_seen_at` / `detail_status`)。
+- **状态机**:`detail_status ∈ {pending, processing, done, failed}`。`claim_one` 是 CAS(`pending → processing`),`mark_done / mark_failed` 处理后状态。`DocumentTooLarge` 不切片不截断,直接 failed。
+- **列表解析选择器**:`table.table2`(真实结果);`table.table3` 是 Sponsored Links 必须忽略。详情链接 regex: `-torrent-\d+\.html`。
+- **搜索 URL 时间过滤**:无,搜索结果按 site 默认顺序。
+- **MongoDB**:`mongodb://localhost:27017/` → DB `bt_limetorrents_spider_db` → collections `bt_info_list` / `bt_info_detail`。
+  - `bt_info_list` 字段:`_id / name / detail_url / torrent_url / category / added_text / added_at / size / seeders / leechers / observed_at / source / discovery_mode / keywords / discovery_modes / first_seen_at / last_seen_at / detail_status / detail_started_at / detail_processed_at / detail_error`
+  - `bt_info_detail` 字段:`_id / detail_url / name / info_hash / added_text / added_at / category / total_size / meta_description / resource_links{magnet,torrent,stream} / trackers[] / tracker_count / successful_tracker_count / failed_tracker_count / files[] / declared_file_count / file_entry_count / related_torrents[] / comments_count / html_cache_path / source / parsed_at`
+  - 索引:`bt_info_list` 上 `detail_url(unique)` / `detail_status` / `keywords` / `(category, added_at DESC)`;`bt_info_detail` 上 `detail_url(unique)` / `info_hash`。
+- **Checkpoint**:每个 (mode, category, keyword) 独立 `data/checkpoints/limetorrents-<md5>.json`,原子写(.tmp + replace)。失败页不推进 checkpoint,留给 wrapper 重试。
+- **CLI**:
+  - `crawl_limetorrents.py [--keyword KW] [--category CAT=Movies] [--search-category CAT=all] [--start-page N=1] [--max-pages N=0] [--page-sleep S=1.0]`
+  - `crawl_limetorrents_by_keys.py [--search-category CAT=all] [-c N=1]`(N 受环境变量 `CRAWL_LIMETORRENTS_CONCURRENCY` 影响)
+  - `crawl_detail_limetorrents.py [-c N=2] [-b N=100] [-p S=1.0] [-l N=0] [-k KW] [--force] [--retry-failed] [--dry-run]`
+
+## 分类与搜索词合法值
+
+- 浏览分类(`--category`):`anime / applications / games / movies / music / tv-shows / other`(`tv` / `TV shows` 等价于 `tv-shows`)。`normalize_category` 严格匹配,无效值抛 `ValueError`。
+- 搜索分类(`--search-category`):除上面 7 个浏览分类外,允许 `all`(其余一律拒绝)。
 
 ## 已知 TODO / 占位实现
 
-- `get_share_valid_status`（`main_01.py:245`）所有分支都直接返回 `True`，未接真实校验 API。注释里标了 `await AliYunPanApi.get_share_valid_status(...)` 等接口形态但未实现。
-- `data/parsed_results.csv` 只有表头（`序号,标题,URL,描述,来源,日期`），主流程没回写 CSV，只有 `parse_index.py` 的 `save_to_csv` 会写但写的是 `D:/workspace/project/...` 硬编码路径。
+- `crawl_detail_limetorrents.run_one` 中 `DocumentTooLarge` 已显式失败但不切片不截断,这是**预期**行为(失败后保留原 `files`,方便人工 review)。
+- `data/keys-done.txt` 累计成功 key;`data/keys.txt` 失败 key 不写 done,下次 wrapper 重跑自动从中断页续爬(checkpoint 落盘)。
 
 ## 修改时的注意
 
-- 修改 `RegexUtils.py` 的正则：要跑 `parse_index.py`（改路径后）对照 `data/index.html` 看实际匹配数变化。
-- 新增网盘厂商：需要 (1) 新建 `XxxRegexUtils` 类并提供同样的 5 个方法（has_valid_url / parse_txt_url_multi / parse_txt_url_and_pwd_multi / parse_txt_url_and_pwd_split_multi / parse_txt_multi）；(2) 在 `RegexUtils.parse_txt_multi` 入口加一行调用；(3) 在 `RegexUtils.get_pan_url_by_pname` 加分支；(4) 在 `main_01.get_share_valid_status` 加分支；(5) 在 `main_01.save_url_objects` 的 `pwd == "dany"` 守卫之前不需要改。
-- 项目无锁文件（`uv pip freeze > requirements.txt` 是当前约定的快照方式，不区分直接依赖与传递依赖）；依赖变更请同步刷新 `requirements.txt`。
+- 修改 `crawl_limetorrents.py` 的选择器或 regex:跑 `tests/test_limetorrents_listing.py` 等离线测试对照 fixture 看匹配数;真实验证用 `crawl_limetorrents.py --max-pages 1` 跑单页。
+- 新增搜索来源:需要 (1) 复刻 `parse_result_row` 字段名 / 字段约定;(2) 走 `upsert_listing` 幂等 upsert;(3) checkpoint 文件名 hash 与现有一致(无需改);(4) MongoDB schema 不变。
+- 新增详情字段:在 `parse_detail` dict 里加,pytest 加一条覆盖断言,无需改 schema(只往里加字段不破坏既有 doc)。
+- 项目无锁文件(`uv pip freeze > requirements.txt` 是当前约定的快照方式);依赖变更请同步刷新 `requirements.txt`。

@@ -1,5 +1,5 @@
 """
-三方对照验证:HTML vs parse_listing() vs 截图。
+三方对照验证:LimeTorrents 列表 HTML vs parse_listing() vs 截图。
 
 跑法:.venv/Scripts/python.exe tests/verify_parse_vs_html.py [keyword]
 默认 keyword=Music(已入库过)。
@@ -18,7 +18,7 @@ from pathlib import Path
 from DrissionPage import ChromiumPage, ChromiumOptions
 from bs4 import BeautifulSoup
 
-# 让 import 找到项目根的 crawl_1337x_by_key
+# 让 import 找到项目根的 crawl_limetorrents
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from crawl_limetorrents import (
     parse_listing, BASE,
@@ -43,7 +43,7 @@ def main():
     logger.info(f"目标 URL: {search_url}")
 
     # DrissionPage 自启 headless Chrome(auto_port 强制独立进程),
-    # 与 crawl_1337x_by_key.py 同一模式,不依赖外部 9222 实例。
+    # 与 crawl_limetorrents.py 同一模式,不依赖外部 9222 实例。
     logger.info("正在通过 DrissionPage 自启 Chrome 并加载列表页第 1 页")
     options = ChromiumOptions().auto_port(True)
     page = ChromiumPage(options)
@@ -88,7 +88,7 @@ def main():
     for i, it in enumerate(items, 1):
         if not it["name"]:
             problems.append(f"第 {i} 条 name 为空")
-        if not it["detail_url"].startswith("https://1337x.to/"):
+        if not it["detail_url"].startswith(BASE + "/"):
             problems.append(f"第 {i} 条 detail_url 异常: {it['detail_url']}")
         if not isinstance(it["seeds"], int) or it["seeds"] < 0:
             problems.append(f"第 {i} 条 seeds 异常: {it['seeds']}")
@@ -134,7 +134,7 @@ def main():
     if len(items) == len(rows_html) and not problems:
         logger.info(
             f"通过:HTML 行数={len(rows_html)} == 解析数={len(items)},"
-            f"字段全部合法,parse_listing 与 1337x 列表页结构完全匹配"
+            f"字段全部合法,parse_listing 与 LimeTorrents 列表页结构完全匹配"
         )
         return 0
     else:
