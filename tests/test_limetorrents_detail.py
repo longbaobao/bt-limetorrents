@@ -26,6 +26,11 @@ def test_real_detail_basic_fields_and_links():
     assert detail["resource_links"]["magnet"].startswith("magnet:?xt=urn:btih:")
     assert ".torrent" in detail["resource_links"]["torrent"]
     assert detail["resource_links"]["stream"] == "https://www.limemovies.org/"
+    assert detail["declared_file_count"] == 3
+    assert detail["file_entry_count"] == 4
+    assert len(detail["files"]) == 4
+    assert len(detail["related_torrents"]) >= 5
+    assert detail["comments_count"] == 0
 
 
 def test_broken_detail_raises_parse_error():

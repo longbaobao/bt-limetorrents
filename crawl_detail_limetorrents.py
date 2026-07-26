@@ -18,6 +18,7 @@ from urllib.parse import urljoin
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutTimeout
 from threading import Semaphore
 from bs4 import BeautifulSoup
+from bs4.element import NavigableString, Tag
 from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.errors import ElementNotFoundError, PageDisconnectedError
 
@@ -28,9 +29,17 @@ from crawl_limetorrents import (
     MONGO_URI,
     fetch_with_cf_bypass,
     parse_limetorrents_time,
+    parse_result_row,
 )
 COLL_LIST = "bt_info_list"
 COLL_DETAIL = "bt_info_detail"
+
+ICON_TYPES = {
+    "csprite_doc_dir": "directory",
+    "csprite_doc_video": "video",
+    "csprite_doc_nfo": "nfo",
+    "csprite_doc_doc": "document",
+}
 
 HTML_DIR = Path("data/html/limetorrents")
 
@@ -250,6 +259,119 @@ def parse_trackers(soup, ref_now: datetime) -> list[dict]:
     return trackers
 
 
+def _icon_type(node: Tag) -> str | None:
+    classes = set(node.get("class", []))
+    for class_name, entry_type in ICON_TYPES.items():
+        if class_name in classes:
+            return entry_type
+    if any(name.startswith("csprite_doc_") for name in classes):
+        return "file"
+    return None
+
+
+def parse_files(soup) -> tuple[list[dict], int]:
+    declared_count = 0
+    for heading in soup.select("h2"):
+        match = re.search(
+            r"Torrent File Content\s*\((\d+)\s+files?\)",
+            heading.get_text(" ", strip=True),
+            re.IGNORECASE,
+        )
+        if match:
+            declared_count = int(match.group(1))
+            break
+
+    entries = []
+    directory_stack: list[str] = []
+    for fileline in soup.select(".fileline"):
+        current_type = "file"
+        current_text: list[str] = []
+        current_size = ""
+
+        def flush() -> None:
+            nonlocal current_text, current_size, directory_stack
+            raw = "".join(current_text)
+            leading = len(raw) - len(raw.lstrip(" \t\r\n\xa0"))
+            depth_hint = leading // 4
+            raw_name = " ".join(raw.replace("\xa0", " ").split()).rstrip(" -")
+            if not raw_name:
+                current_text = []
+                current_size = ""
+                return
+            if current_type == "directory":
+                depth = min(depth_hint, len(directory_stack))
+                parents = directory_stack[:depth]
+                path = "/".join([*parents, raw_name])
+                directory_stack = [*parents, raw_name]
+            else:
+                depth = min(
+                    depth_hint or len(directory_stack),
+                    len(directory_stack),
+                )
+                path = "/".join([*directory_stack[:depth], raw_name])
+            entries.append({
+                "entry_index": len(entries),
+                "path": path,
+                "size": current_size,
+                "entry_type": current_type,
+                "depth": depth,
+            })
+            current_text = []
+            current_size = ""
+
+        for child in fileline.children:
+            if isinstance(child, NavigableString):
+                current_text.append(str(child))
+                continue
+            if not isinstance(child, Tag):
+                continue
+            detected = _icon_type(child)
+            if detected:
+                flush()
+                current_type = detected
+            elif "filelinesize" in child.get("class", []):
+                current_size = child.get_text(" ", strip=True)
+            elif child.name == "br":
+                flush()
+            else:
+                current_text.append(child.get_text(" ", strip=True))
+        flush()
+    return entries, declared_count
+
+
+def parse_related_torrents(soup, ref_now: datetime) -> list[dict]:
+    table = find_table_after_heading(soup, "Related torrents", "table2")
+    if table is None:
+        return []
+    result = []
+    for row in table.select("tr"):
+        if row.select_one("th"):
+            continue
+        item = parse_result_row(row, fallback_category="", ref_now=ref_now)
+        if not item:
+            continue
+        result.append({
+            key: item[key]
+            for key in (
+                "name", "detail_url", "added_text", "added_at",
+                "category", "size", "seeders", "leechers",
+            )
+        })
+    return result
+
+
+def parse_comments_count(soup) -> int:
+    for heading in soup.select("h2"):
+        match = re.search(
+            r"Comments\s*\((\d+)\s+Comments?\)",
+            heading.get_text(" ", strip=True),
+            re.IGNORECASE,
+        )
+        if match:
+            return int(match.group(1))
+    return 0
+
+
 def parse_detail(
     html: str,
     detail_url: str,
@@ -257,8 +379,7 @@ def parse_detail(
 ) -> dict:
     """将 LimeTorrents 详情页 HTML 解析为 bt_info_detail 文档。
 
-    第一版:基本信息 + magnet/.torrent/stream 资源链接 + trackers;留白
-    (files / related_torrents / comments_count) 留给 Task 7 填充。
+    解析基本信息、资源链接、trackers、完整文件树、相关 torrents 与评论计数。
     """
     ref_now = ref_now or datetime.now()
     soup = BeautifulSoup(html, "html.parser")
@@ -278,6 +399,8 @@ def parse_detail(
         "stream": basic.pop("stream"),
     }
     trackers = parse_trackers(soup, ref_now)
+    files, declared_file_count = parse_files(soup)
+    related_torrents = parse_related_torrents(soup, ref_now)
     return {
         "_id": hashlib.md5(detail_url.encode("utf-8")).hexdigest(),
         "detail_url": detail_url,
@@ -293,11 +416,11 @@ def parse_detail(
         "tracker_count": len(trackers),
         "successful_tracker_count": sum(t["status"] == "success" for t in trackers),
         "failed_tracker_count": sum(t["status"] == "failed" for t in trackers),
-        "files": [],
-        "declared_file_count": 0,
-        "file_entry_count": 0,
-        "related_torrents": [],
-        "comments_count": 0,
+        "files": files,
+        "declared_file_count": declared_file_count,
+        "file_entry_count": len(files),
+        "related_torrents": related_torrents,
+        "comments_count": parse_comments_count(soup),
         "html_cache_path": str(html_cache_path(detail_url)).replace("\\", "/"),
         "source": "limetorrents",
         "parsed_at": ref_now.strftime("%Y-%m-%d %H:%M:%S"),
