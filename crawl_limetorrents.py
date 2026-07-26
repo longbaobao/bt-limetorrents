@@ -18,9 +18,9 @@ import re
 import time
 import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 from DrissionPage import ChromiumPage, ChromiumOptions
 from bs4 import BeautifulSoup
@@ -33,10 +33,100 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BASE = "https://1337x.to"
+BASE = "https://www.limetorrents.fun"
 MONGO_URI = "mongodb://localhost:27017/"
-DB_NAME = "bt_13337x_spider_db"
+DB_NAME = "bt_limetorrents_spider_db"
 COLL_NAME = "bt_info_list"
+
+BROWSE_CATEGORIES = {
+    "anime": "Anime",
+    "applications": "Applications",
+    "games": "Games",
+    "movies": "Movies",
+    "music": "Music",
+    "tv-shows": "TV-shows",
+    "tv shows": "TV-shows",
+    "tv": "TV-shows",
+    "other": "Other",
+}
+
+
+def normalize_category(value: str, allow_all: bool = False) -> str:
+    normalized = re.sub(r"\s+", " ", value.strip()).lower()
+    if allow_all and normalized == "all":
+        return "all"
+    try:
+        return BROWSE_CATEGORIES[normalized]
+    except KeyError as exc:
+        raise ValueError(f"不支持的分类: {value}") from exc
+
+
+def slugify_keyword(keyword: str) -> str:
+    collapsed = re.sub(r"\s+", "-", keyword.strip())
+    if not collapsed:
+        raise ValueError("关键词不能为空")
+    return quote(collapsed, safe="-")
+
+
+def build_browse_url(category: str, page: int = 1) -> str:
+    if page < 1:
+        raise ValueError("page 必须大于等于 1")
+    category = normalize_category(category)
+    return f"{BASE}/browse-torrents/{category}/date/{page}/"
+
+
+def build_search_url(category: str, keyword: str, page: int = 1) -> str:
+    if page < 1:
+        raise ValueError("page 必须大于等于 1")
+    category = normalize_category(category, allow_all=True)
+    base = f"{BASE}/search/{category}/{slugify_keyword(keyword)}/"
+    return base if page == 1 else f"{base}/{page}/"
+
+
+def now_str() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def parse_limetorrents_time(
+    text: str, ref_now: datetime | None = None
+) -> str:
+    ref_now = ref_now or datetime.now()
+    raw = re.sub(r"\s+-?\s*in\s+.+$", "", text.strip(), flags=re.IGNORECASE)
+    if not raw:
+        return ""
+    if raw.lower() == "today":
+        return ref_now.strftime("%Y-%m-%d %H:%M:%S")
+    if raw.lower() == "yesterday":
+        return (ref_now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+    match = re.fullmatch(
+        r"(\d+)\s+(minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)\s+ago",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        value = int(match.group(1))
+        unit = match.group(2).lower()
+        if unit.startswith("minute"):
+            delta = timedelta(minutes=value)
+        elif unit.startswith("hour"):
+            delta = timedelta(hours=value)
+        elif unit.startswith("day"):
+            delta = timedelta(days=value)
+        elif unit.startswith("week"):
+            delta = timedelta(weeks=value)
+        elif unit.startswith("month"):
+            delta = timedelta(days=30 * value)
+        else:
+            delta = timedelta(days=365 * value)
+        return (ref_now - delta).strftime("%Y-%m-%d %H:%M:%S")
+
+    for fmt in ("%b %d, %Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return ""
 
 # 旧 Playwright 时代用的 CDP 端口常量,留作向后兼容(给 crawl_detail_1337x.py 复用),
 # 本脚本已不再使用(DrissionPage 用 auto_port 自启)。如果 detail crawler 也迁走,即可删除。
