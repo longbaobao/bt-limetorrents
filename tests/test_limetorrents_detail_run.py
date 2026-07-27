@@ -68,7 +68,7 @@ def _related_id(detail_url: str) -> str:
 
 def test_document_too_large_is_failed_without_truncation(monkeypatch):
     files = [{"path": str(i)} for i in range(5000)]
-    monkeypatch.setattr(detail, "fetch_one", lambda tab, url: "<html></html>")
+    monkeypatch.setattr(detail, "fetch_one", lambda tab, url, backend=None: "<html></html>")
     monkeypatch.setattr(detail, "save_html_cache", lambda url, html: None)
     monkeypatch.setattr(detail, "parse_detail", lambda html, url: {
         "_id": "abc", "detail_url": url, "files": files,
@@ -102,7 +102,7 @@ def test_run_one_success_persists_related_into_list(monkeypatch):
     related_count = len(parsed["related_torrents"])
     assert related_count >= 5, "fixture 应至少有 5 条 related 用以测试"
 
-    monkeypatch.setattr(detail, "fetch_one", lambda tab, url: "<html></html>")
+    monkeypatch.setattr(detail, "fetch_one", lambda tab, url, backend=None: "<html></html>")
     monkeypatch.setattr(detail, "save_html_cache", lambda url, html: None)
     monkeypatch.setattr(detail, "parse_detail", lambda html, url: parsed)
 
@@ -153,7 +153,7 @@ def test_run_one_related_upsert_carries_source_and_discovery_mode(monkeypatch):
         DETAIL_URL,
         REF,
     )
-    monkeypatch.setattr(detail, "fetch_one", lambda tab, url: "<html></html>")
+    monkeypatch.setattr(detail, "fetch_one", lambda tab, url, backend=None: "<html></html>")
     monkeypatch.setattr(detail, "save_html_cache", lambda url, html: None)
     monkeypatch.setattr(detail, "parse_detail", lambda html, url: parsed)
 
@@ -187,7 +187,7 @@ def test_run_one_parse_error_does_not_upsert_related(monkeypatch):
     def boom(html, url):
         raise ParseError(f"无法解析 {url}")
 
-    monkeypatch.setattr(detail, "fetch_one", lambda tab, url: "<html></html>")
+    monkeypatch.setattr(detail, "fetch_one", lambda tab, url, backend=None: "<html></html>")
     monkeypatch.setattr(detail, "save_html_cache", lambda url, html: None)
     monkeypatch.setattr(detail, "parse_detail", boom)
 
@@ -218,7 +218,7 @@ def test_run_one_document_too_large_does_not_upsert_related(monkeypatch):
         DETAIL_URL,
         REF,
     )
-    monkeypatch.setattr(detail, "fetch_one", lambda tab, url: "<html></html>")
+    monkeypatch.setattr(detail, "fetch_one", lambda tab, url, backend=None: "<html></html>")
     monkeypatch.setattr(detail, "save_html_cache", lambda url, html: None)
     monkeypatch.setattr(detail, "parse_detail", lambda html, url: parsed)
 
@@ -261,7 +261,7 @@ def test_related_upsert_isolated_when_one_raises(monkeypatch):
     related_count = len(parsed["related_torrents"])
     assert related_count >= 5, "fixture 应至少有 5 条 related 用以测试隔离"
 
-    monkeypatch.setattr(detail, "fetch_one", lambda tab, url: "<html></html>")
+    monkeypatch.setattr(detail, "fetch_one", lambda tab, url, backend=None: "<html></html>")
     monkeypatch.setattr(detail, "save_html_cache", lambda url, html: None)
     monkeypatch.setattr(detail, "parse_detail", lambda html, url: parsed)
 

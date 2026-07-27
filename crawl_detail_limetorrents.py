@@ -28,6 +28,15 @@ from bs4.element import NavigableString, Tag
 from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.errors import ElementNotFoundError, PageDisconnectedError
 
+# request_client 提供 CurlCffiBackend 与 FetchBackend Protocol
+# 长线分支 worktree-feature-curl-cffi-replacement 才有此模块;
+# 老 worktree / main 直接 ImportError 时回退到 drission-only 路径。
+try:
+    from request_client import CurlCffiBackend, FetchBackend  # type: ignore
+except ImportError:  # pragma: no cover - worktree 兼容
+    CurlCffiBackend = None  # type: ignore
+    FetchBackend = None  # type: ignore
+
 # 复用 crawl_limetorrents 共享常量与解析器（详见 crawl_limetorrents.py）
 from crawl_limetorrents import (
     BASE,
@@ -452,12 +461,20 @@ def parse_detail(
 # ============================================================
 
 
-def fetch_one(tab, url: str) -> str:
-    """访问详情页并返回 HTML 字符串。Cloudflare 5秒盾由 fetch_with_cf_bypass 自动等待。
+def fetch_one(tab, url: str, backend=None) -> str:
+    """访问详情页并返回 HTML 字符串。
 
-    目标选择器 `css:div.torrentinfo` 命中 LimeTorrents 详情正文容器。
-    Raises: TimeoutError (目标元素始终未出现) / 原始 DrissionPage 异常。
+    - 默认走 DrissionPage + Cloudflare 5秒盾自动等待,
+      目标选择器 `css:div.torrentinfo`。
+    - 如果 ``backend`` 是 ``CurlCffiBackend`` 实例,
+      直接走纯 HTTP（无浏览器），30s timeout，3 次重试；不再做选择器等待。
+
+    Raises: TimeoutError (DrissionPage 目标元素始终未出现) /
+            RuntimeError (curl_cffi 重试耗尽) /
+            原始 DrissionPage / curl_cffi 异常。
     """
+    if backend is not None:
+        return backend.fetch(url)
     return fetch_with_cf_bypass(tab, url, "css:div.torrentinfo", max_wait=45)
 
 
@@ -542,10 +559,13 @@ def _persist_related_listings(coll_list, parsed: dict) -> int:
     return success
 
 
-def run_one(tab, doc: dict, coll_list, coll_detail, dry_run: bool = False) -> str:
+def run_one(tab, doc: dict, coll_list, coll_detail, dry_run: bool = False, backend=None) -> str:
     """处理单条 URL → 持久化一条记录。返回 'done' 或 'failed'。
 
     顺序固定：fetch → cache → parse → replace/upsert → done。
+
+    ``backend`` 为 None 时走 DrissionPage；为 ``CurlCffiBackend`` 实例时
+    由该对象直接返回 HTML（不再依赖浏览器 tab），适合无浏览器环境的批量抓取。
 
     异常分类：
     - DocumentTooLarge → 不重试，立即 failed（不切片不截断 files）
@@ -562,7 +582,7 @@ def run_one(tab, doc: dict, coll_list, coll_detail, dry_run: bool = False) -> st
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            html = fetch_one(tab, url)
+            html = fetch_one(tab, url, backend=backend)
             save_html_cache(url, html)
             parsed = parse_detail(html, url)
             if dry_run:
@@ -607,60 +627,78 @@ def run_one(tab, doc: dict, coll_list, coll_detail, dry_run: bool = False) -> st
     return "failed"
 
 
-def run_batch(browser: ChromiumPage, docs: list, coll_list, coll_detail, concurrency: int, dry_run: bool) -> tuple[int, int]:
+def run_batch(browser: ChromiumPage, docs: list, coll_list, coll_detail, concurrency: int, dry_run: bool, backend=None) -> tuple[int, int]:
     """开 N 个 tab 并行跑一批 docs，返回 (done, failed)。
 
-    每个 task 用 future.result(timeout=RUN_ONE_BUDGET) 包 run_one，强制 60s 总预算。
-    超时 → mark_failed + 返回 "failed"（并跳过 DB 写）。
-
-    浏览器死亡快检：批开始前先试一次 new_tab，失败则整批跳过，
-    避免 100 条 doc 全部走完 100 次 new_tab 失败才意识到浏览器死了。
+    - browser 模式:每个 task 用 future.result(timeout=RUN_ONE_BUDGET) 包 run_one，
+      强制 60s 总预算。超时 → mark_failed + 返回 "failed"（并跳过 DB 写）。
+      浏览器死亡快检:批开始前先试一次 new_tab，失败则整批跳过，
+      避免 100 条 doc 全部走完 100 次 new_tab 失败才意识到浏览器死了。
+    - backend 模式 (curl_cffi):跳过浏览器健康检查，直接 ThreadPoolExecutor 并发跑 run_one；
+      每个 run_one 内部 backend.fetch() 自带 3 次重试 + 30s timeout。
     """
     sem = Semaphore(concurrency)
 
-    # 浏览器健康检查：试开一 tab 立即关掉
-    try:
-        health_tab = browser.new_tab()
-        health_tab.close()
-    except Exception as e:
-        err = f"browser dead, batch aborted: {type(e).__name__}: {e}"
-        logger.error(f"浏览器已不可用，整批 {len(docs)} 条跳过：{e}")
-        if not dry_run:
-            for doc in docs:
-                mark_failed(coll_list, doc["_id"], err)
-        return 0, len(docs)
+    if backend is None:
+        # 浏览器健康检查:试开一 tab 立即关掉
+        try:
+            health_tab = browser.new_tab()
+            health_tab.close()
+        except Exception as e:
+            err = f"browser dead, batch aborted: {type(e).__name__}: {e}"
+            logger.error(f"浏览器已不可用，整批 {len(docs)} 条跳过：{e}")
+            if not dry_run:
+                for doc in docs:
+                    mark_failed(coll_list, doc["_id"], err)
+            return 0, len(docs)
 
     def one(doc):
         with sem:
-            try:
-                tab = browser.new_tab()
-            except Exception as e:
-                # 浏览器上下文已关闭 / new_tab 失败 —— 单条 doc 标 failed
-                err = f"new_tab failed: {type(e).__name__}: {e}"
-                logger.error(f"[{doc['_id'][:8]}] {err}（浏览器可能已关闭）")
-                if not dry_run:
-                    mark_failed(coll_list, doc["_id"], err)
-                return "failed"
-            try:
-                with ThreadPoolExecutor(max_workers=1) as inner:
-                    fut = inner.submit(run_one, tab, doc, coll_list, coll_detail, dry_run=dry_run)
-                    return fut.result(timeout=RUN_ONE_BUDGET)
-            except FutTimeout:
-                if not dry_run:
-                    mark_failed(coll_list, doc["_id"], f"run_one exceeded {RUN_ONE_BUDGET}s budget")
-                return "failed"
-            except Exception as e:
-                # run_one 内部已有 try/except，但外层兜底（tab 状态异常等）
-                err = f"{type(e).__name__}: {e}"
-                logger.error(f"[{doc['_id'][:8]}] run_one 抛出未捕获异常：{err}")
-                if not dry_run:
-                    mark_failed(coll_list, doc["_id"], err)
-                return "failed"
-            finally:
+            if backend is None:
+                # 浏览器模式:每个 task 一个新 tab，DrissionPage 单 tab 串行 fetch
                 try:
-                    tab.close()
-                except Exception:
-                    pass  # tab 可能已 dead，忽略关闭错误
+                    tab = browser.new_tab()
+                except Exception as e:
+                    err = f"new_tab failed: {type(e).__name__}: {e}"
+                    logger.error(f"[{doc['_id'][:8]}] {err}（浏览器可能已关闭）")
+                    if not dry_run:
+                        mark_failed(coll_list, doc["_id"], err)
+                    return "failed"
+                try:
+                    with ThreadPoolExecutor(max_workers=1) as inner:
+                        fut = inner.submit(
+                            run_one, tab, doc, coll_list, coll_detail,
+                            dry_run=dry_run, backend=None,
+                        )
+                        return fut.result(timeout=RUN_ONE_BUDGET)
+                except FutTimeout:
+                    if not dry_run:
+                        mark_failed(coll_list, doc["_id"], f"run_one exceeded {RUN_ONE_BUDGET}s budget")
+                    return "failed"
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                    logger.error(f"[{doc['_id'][:8]}] run_one 抛出未捕获异常：{err}")
+                    if not dry_run:
+                        mark_failed(coll_list, doc["_id"], err)
+                    return "failed"
+                finally:
+                    try:
+                        tab.close()
+                    except Exception:
+                        pass
+            else:
+                # curl_cffi 模式:无 tab，直接 backend.fetch;run_one 自带 3 次重试
+                try:
+                    return run_one(
+                        None, doc, coll_list, coll_detail,
+                        dry_run=dry_run, backend=backend,
+                    )
+                except Exception as e:
+                    err = f"{type(e).__name__}: {e}"
+                    logger.error(f"[{doc['_id'][:8]}] curl_cffi 抛出未捕获异常：{err}")
+                    if not dry_run:
+                        mark_failed(coll_list, doc["_id"], err)
+                    return "failed"
 
     with ThreadPoolExecutor(max_workers=concurrency) as outer:
         results = list(outer.map(one, docs))
@@ -680,6 +718,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--force", action="store_true", help="无视 status 强制重跑")
     parser.add_argument("--retry-failed", action="store_true", help="重置 failed → pending 后再跑")
     parser.add_argument("--dry-run", action="store_true", help="只解析不写")
+    parser.add_argument(
+        "--backend",
+        choices=["drission", "curl_cffi"],
+        default="drission",
+        help="抓取后端；长线分支支持 --backend curl_cffi 跳过浏览器启动。"
+             "curl_cffi 模式不依赖 Chrome，并发走纯 HTTP，可远超浏览器并发上限。",
+    )
     args = parser.parse_args(argv)
     if args.concurrency < 1:
         parser.error("--concurrency 必须大于等于 1")
@@ -739,9 +784,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # DrissionPage 自启 headless Chrome（auto_port 强制独立进程）
     # 一个 ChromiumPage 实例 = 一个 Chrome 进程；并发靠多 tab + ThreadPoolExecutor
-    options = ChromiumOptions().auto_port(True)
-    browser = ChromiumPage(options)
-    logger.info(f"DrissionPage 已启动独立 headless Chrome (address={options.address})")
+    if args.backend == "curl_cffi":
+        from request_client import CurlCffiBackend
+
+        backend: FetchBackend | None = CurlCffiBackend()
+        browser = None
+        logger.info("长线分支：详情抓取使用 curl_cffi 后端（无浏览器进程）")
+    else:
+        backend = None
+        options = ChromiumOptions().auto_port(True)
+        browser = ChromiumPage(options)
+        logger.info(f"DrissionPage 已启动独立 headless Chrome (address={options.address})")
 
     try:
         batch_idx = 0
@@ -767,7 +820,7 @@ def main(argv: list[str] | None = None) -> int:
             t0 = time.time()
             logger.info(f"[batch {batch_idx}] 拿到 {len(batch)} 条，开始处理")
             done, failed = run_batch(browser, batch, coll_list, coll_detail,
-                                     args.concurrency, args.dry_run)
+                                     args.concurrency, args.dry_run, backend=backend)
             elapsed = time.time() - t0
             total_done += done
             total_failed += failed
@@ -790,11 +843,14 @@ def main(argv: list[str] | None = None) -> int:
             reverse = rescue_orphaned_processing(coll_list)
             if reverse:
                 logger.info(f"退出前反向置回 {reverse} 条 processing → pending")
-        try:
-            browser.quit()
-            logger.info("DrissionPage Chrome 已关闭")
-        except Exception as e:
-            logger.warning(f"关闭 Chrome 时异常: {type(e).__name__}: {e}")
+        if browser is not None:
+            try:
+                browser.quit()
+                logger.info("DrissionPage Chrome 已关闭")
+            except Exception as e:
+                logger.warning(f"关闭 Chrome 时异常: {type(e).__name__}: {e}")
+        else:
+            logger.info("curl_cffi 后端：退出时无需关闭浏览器")
 
     logger.info(
         f"完成。done={total_done} failed={total_failed} "
