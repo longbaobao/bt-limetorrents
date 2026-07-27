@@ -2,7 +2,7 @@
 import re
 import sys
 sys.path.insert(0, ".")
-from crawl_detail_1337x import now_str
+from crawl_detail_limetorrents import now_str
 
 
 def test_format():

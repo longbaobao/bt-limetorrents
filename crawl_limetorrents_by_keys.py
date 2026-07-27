@@ -1,15 +1,13 @@
 """
-1337x 多关键词并发抓取 wrapper。
+LimeTorrents 多关键词并发抓取 wrapper。
 
-从 data/keys.txt 读每个 key,subprocess 调用 crawl_1337x_by_key.py 处理,
+从 data/keys.txt 读每个 key,subprocess 调用 crawl_limetorrents.py 处理,
 成功的 key 追加到 data/keys-done.txt(线程锁保护)。
 已 done 的 key 自动跳过,失败的 key 不写 done(下次重试可捡起)。
 
-重试策略: 子脚本 crawl_1337x_by_key.py 内置 run_with_retry() 共享一个
-subprocess,内部最多尝试 MAX_ATTEMPTS 次(每次自启独立 Chrome,避免卡死
-page 状态污染),断点落盘到 data/checkpoints/。wrapper 这里只管并发调度
-+ 单 key 硬性超时兜底(WORKER_TIMEOUT 秒,防止子进程失控)。
-失败重跑 wrapper 即可从中断页续爬,跨多次运行最终爬完大 key。
+重试策略: 子脚本 crawl_limetorrents.py 内不内置重试,失败页直接 returncode 非 0,
+wrapper 用 WORKER_TIMEOUT 兜底(防止子进程失控卡死)。
+失败重跑 wrapper 即可从中断页续爬(checkpoint 由子脚本自己落盘到 data/checkpoints/)。
 
 并发模型:
     -c N   ThreadPoolExecutor(N) 调 N 个 worker subprocess,每个 worker
@@ -36,22 +34,22 @@ logger = logging.getLogger(__name__)
 
 KEYS_FILE = Path("data/keys.txt")
 DONE_FILE = Path("data/keys-done.txt")
-SCRIPT = "crawl_1337x_by_key.py"
+SCRIPT = "crawl_limetorrents.py"
 # 单 key 子进程的硬性兜底超时(含子脚本内全部重试时间,并非每次重试的独立超时)。
 # 子脚本重试时退出码非 0(超时/CF 拦截/解析失败)会被 wrapper 标记为不写 done、
 # 断点保留,下次重跑 wrapper 自动从中断页续爬。
 WORKER_TIMEOUT = 600
 
-# 重试策略已移入 crawl_1337x_by_key.py 的 run_with_retry():
-# 共享一个 subprocess,内部最多重试 4 次(每次自启独立 Chrome,避免卡死 page 状态污染),
-# 失败时断点落盘,下次再跑 wrapper 从中断页继续。
+# 重试策略:子脚本内不内置重试,失败直接 returncode 非 0 + 保留 checkpoint,
+# 下次再跑 wrapper 通过 load_checkpoint 从中断页续爬。
 
 # 全局并发设置:环境变量优先,默认 1(纯串行,向后兼容)
 # 范围 [1, 16];CLI --concurrency 可临时覆盖
-ENV_CONCURRENCY = "CRAWL_1337X_CONCURRENCY"
+ENV_CONCURRENCY = "CRAWL_LIMETORRENTS_CONCURRENCY"
 DEFAULT_CONCURRENCY = 1
 MIN_CONCURRENCY = 1
 MAX_CONCURRENCY = 16
+_DONE_LOCK = threading.Lock()
 
 
 def resolve_concurrency() -> int:
@@ -99,27 +97,40 @@ def load_done() -> set[str]:
     }
 
 
-def append_done(key: str, lock: threading.Lock) -> None:
+def append_done(key: str, lock=None) -> None:
     """线程安全地追加一行到 done.txt 并 flush。"""
-    with lock:
+    active_lock = lock or _DONE_LOCK
+    with active_lock:
         with DONE_FILE.open("a", encoding="utf-8") as f:
             f.write(key + "\n")
             f.flush()
 
 
-def run_one(key: str) -> tuple[str, int, str]:
+def build_worker_args(key: str, search_category: str) -> list[str]:
+    return [
+        sys.executable,
+        SCRIPT,
+        "--keyword",
+        key,
+        "--search-category",
+        search_category,
+    ]
+
+
+def run_one(key: str, search_category: str) -> tuple[str, int, str]:
     """subprocess 跑单个 key。返回 (key, returncode, stderr_tail)。
 
-    重试逻辑已在子脚本 crawl_1337x_by_key.py 内实现(共享 Chrome 自重启重试,
-    最多 MAX_ATTEMPTS 次)。wrapper 这里只负责:每个 keyword 启一个 subprocess,
-    用 WORKER_TIMEOUT 做硬性兜底(防止子进程失控卡死)。
+    重试逻辑不在子脚本内做:子脚本失败直接 returncode 非 0,checkpoint 保留,
+    下次 wrapper 重跑时由 load_checkpoint 从中断页续爬。wrapper 这里只负责:
+    每个 keyword 启一个 subprocess,用 WORKER_TIMEOUT 做硬性兜底
+    (防止子进程失控卡死)。
 
     stdout 透传到父进程(实时看到子脚本的中文进度),stderr 截留备用(失败时 dump 尾部)。
     """
-    args = [sys.executable, SCRIPT, key]
+    args = build_worker_args(key, search_category)
     logger.info(
         f"[开始] {key} pid={os.getpid()} "
-        f"(DrissionPage 子脚本内自启 Chrome + 子脚本内重试 {MAX_ATTEMPTS} 次)"
+        f"(DrissionPage 子脚本内自启 Chrome,失败由 checkpoint 续爬)"
     )
     try:
         # encoding 显式 utf-8:Windows 中文系统默认 GBK 会让中文 logging 崩
@@ -136,13 +147,14 @@ def run_one(key: str) -> tuple[str, int, str]:
         stderr_tail = "\n".join((proc.stderr or "").splitlines()[-10:])
         return key, proc.returncode, stderr_tail
     except subprocess.TimeoutExpired:
-        return key, 124, f"timeout after {WORKER_TIMEOUT}s(子进程可能被强制终止,断点已保存)"
-    except Exception as e:
-        return key, 1, f"wrapper exception: {type(e).__name__}: {e}"
+        return key, 124, f"timeout after {WORKER_TIMEOUT}s"
+    except Exception as exc:
+        return key, 1, f"{type(exc).__name__}: {exc}"
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="1337x 多关键词并发抓取 wrapper")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="LimeTorrents 多关键词并发抓取 wrapper")
+    parser.add_argument("--search-category", default="all")
     parser.add_argument(
         "-c", "--concurrency", type=int, default=resolve_concurrency(), choices=range(MIN_CONCURRENCY, MAX_CONCURRENCY + 1), metavar="N",
         help=(
@@ -150,7 +162,7 @@ def main() -> int:
             f" {ENV_CONCURRENCY}={DEFAULT_CONCURRENCY};每个 worker 由 DrissionPage 子脚本自启独立 Chrome)"
         ),
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     concurrency: int = args.concurrency
     env_val = os.environ.get(ENV_CONCURRENCY)
     if env_val and env_val.strip():
@@ -167,7 +179,6 @@ def main() -> int:
         logger.info("无新 key 待处理,退出")
         return 0
 
-    done_lock = threading.Lock()
     failed: list[tuple[str, str]] = []
     started_at = time.time()
 
@@ -176,7 +187,7 @@ def main() -> int:
         worker_started: dict[concurrent.futures.Future, float] = {}
         for key in pending:
             logger.info(f"[入队] {key}")
-            fut = pool.submit(run_one, key)
+            fut = pool.submit(run_one, key, args.search_category)
             futures[fut] = key
             worker_started[fut] = time.time()
         for fut in concurrent.futures.as_completed(futures):
@@ -189,12 +200,12 @@ def main() -> int:
                 logger.error(f"[失败] {key} 耗时 {worker_elapsed:.1f}s 异常: {e}")
                 continue
             if rc == 0:
-                append_done(key, done_lock)
+                append_done(key)
                 logger.info(f"[完成] {key} 耗时 {worker_elapsed:.1f}s → 已写入 done.txt")
             else:
                 logger.error(
                     f"[失败] {key} 耗时 {worker_elapsed:.1f}s 退出码={rc} "
-                    f"(子脚本内已自重试,断点已保留下次可续爬)\n{stderr_tail}"
+                    f"(子脚本失败，断点已保留下次可续爬)\n{stderr_tail}"
                 )
                 failed.append((key, f"退出码={rc}"))
 
