@@ -45,3 +45,23 @@ def test_all_only_allowed_for_search():
     assert normalize_category("all", allow_all=True) == "all"
     with pytest.raises(ValueError, match="不支持的分类"):
         normalize_category("all")
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("Anime.", "Anime"),
+        ("Anime,", "Anime"),
+        ("Anime ;", "Anime"),
+        ("Movies  ", "Movies"),
+        ('"Movies"', "Movies"),
+    ],
+)
+def test_normalize_category_strips_trailing_punctuation(value, expected):
+    """related 区域偶尔会写 `Anime.` / `Movies ;` 等带标点别名,需 trim 后查表。"""
+    assert normalize_category(value) == expected
+
+
+def test_normalize_category_unknown_still_raises_after_trim():
+    with pytest.raises(ValueError, match="不支持的分类"):
+        normalize_category("Reality-TV.")
