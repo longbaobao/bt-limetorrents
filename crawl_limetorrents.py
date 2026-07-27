@@ -248,6 +248,25 @@ def _as_int(text: str) -> int:
     return int(digits) if digits else 0
 
 
+def extract_health(td) -> int | None:
+    r"""从列表行 td.tdright 提取健康度 hbN 整数。
+
+    缺 div / class 名不匹配 hb(\d+) / N 不在 [1, 10] 均返回 None，
+    原样保留空值，绝不重置为 0 或越界。
+    """
+    if td is None:
+        return None
+    health_div = td.select_one('div[class*="hb"]')
+    if health_div is None:
+        return None
+    for class_name in health_div.get("class", []):
+        match = re.fullmatch(r"hb(\d+)", class_name)
+        if match:
+            value = int(match.group(1))
+            return value if 1 <= value <= 10 else None
+    return None
+
+
 def extract_added_category(text: str, fallback: str) -> tuple[str, str]:
     """把 'Added' 单元格文本切成 (added_text, category)。
 
@@ -285,6 +304,7 @@ def parse_result_row(row, *, fallback_category: str, ref_now: datetime) -> dict 
     added_text, category = extract_added_category(added_raw, fallback_category)
     detail_url = urljoin(BASE, detail_link.get("href", ""))
     observed_at = ref_now.strftime("%Y-%m-%d %H:%M:%S")
+    health_cell = row.select_one("td.tdright")
     return {
         "_id": hashlib.md5(detail_url.encode("utf-8")).hexdigest(),
         "name": detail_link.get_text(" ", strip=True),
@@ -296,6 +316,7 @@ def parse_result_row(row, *, fallback_category: str, ref_now: datetime) -> dict 
         "size": size,
         "seeders": _as_int(row.select_one("td.tdseed").get_text(strip=True)) if row.select_one("td.tdseed") else 0,
         "leechers": _as_int(row.select_one("td.tdleech").get_text(strip=True)) if row.select_one("td.tdleech") else 0,
+        "health": extract_health(health_cell),
         "observed_at": observed_at,
         "source": "limetorrents",
     }
