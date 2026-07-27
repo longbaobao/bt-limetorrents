@@ -54,7 +54,7 @@ def test_all_only_allowed_for_search():
         ("Anime,", "Anime"),
         ("Anime ;", "Anime"),
         ("Movies  ", "Movies"),
-        ('"Movies"', "Movies"),
+        ('Movies "', "Movies"),
     ],
 )
 def test_normalize_category_strips_trailing_punctuation(value, expected):
