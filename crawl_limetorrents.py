@@ -53,14 +53,14 @@ BROWSE_CATEGORIES = {
 
 
 def normalize_category(value: str, allow_all: bool = False) -> str:
-    # 站点在 Related 单元格偶尔会写 "Anime." / "Movies " 带末尾标点的别名,
-    # trim 标点 + collapse 空白后再查表,避免 ValueError: 不支持的分类: Anime.
-    cleaned = re.sub(r"[.,;:!\?\"]+$", "", value.strip())
-    normalized = re.sub(r"\s+", " ", cleaned).lower()
-    if allow_all and normalized == "all":
+    # 站点在 Related 单元格偶尔会写 "Anime." / "Movies ;" 等带末尾标点的别名,
+    # 先 collapse 空白再 trim 标点,避免 "Anime ;" 中标点前留有空格导致 trim 失败。
+    cleaned = re.sub(r"\s+", " ", value.strip())
+    cleaned = re.sub(r"[.,;:!\?\"]+$", "", cleaned).lower()
+    if allow_all and cleaned == "all":
         return "all"
     try:
-        return BROWSE_CATEGORIES[normalized]
+        return BROWSE_CATEGORIES[cleaned]
     except KeyError as exc:
         raise ValueError(f"不支持的分类: {value}") from exc
 
