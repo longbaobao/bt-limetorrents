@@ -516,10 +516,28 @@ def main(argv: list[str] | None = None) -> int:
     logger.info(f"MongoDB 已连接: {MONGO_URI}{DB_NAME}.{COLL_NAME}")
 
     processed_pages = 0
-    browser = ChromiumPage(ChromiumOptions().auto_port(True))
+    backend_choice = getattr(args, "backend", "drission")
+    if backend_choice == "curl_cffi":
+        from request_client import CurlCffiBackend
+
+        backend = CurlCffiBackend()
+        browser = None
+        logger.info("长线分支: 使用 curl_cffi 后端（不需要 Chrome 进程）")
+    else:
+        backend = None
+        browser = ChromiumPage(ChromiumOptions().auto_port(True))
     try:
         while url:
-            html = load_page_with_retry(browser, url, page_number)
+            if backend is not None:
+                try:
+                    html = backend.fetch(url)
+                except Exception as exc:
+                    logger.error(
+                        f"第 {page_number} 页 curl_cffi 抓取失败: {type(exc).__name__}: {exc}"
+                    )
+                    return 2
+            else:
+                html = load_page_with_retry(browser, url, page_number)
             if html is None or not has_result_table(html):
                 logger.warning(
                     f"第 {page_number} 页失败(加载={html is None} 或无结果表),"
@@ -576,11 +594,14 @@ def main(argv: list[str] | None = None) -> int:
         clear_checkpoint(mode, category, args.keyword)
         return 0
     finally:
-        try:
-            browser.quit()
-            logger.info("Chrome 已关闭")
-        except Exception as e:
-            logger.warning(f"关闭 Chrome 异常: {type(e).__name__}: {e}")
+        if browser is not None:
+            try:
+                browser.quit()
+                logger.info("Chrome 已关闭")
+            except Exception as e:
+                logger.warning(f"关闭 Chrome 异常: {type(e).__name__}: {e}")
+        else:
+            logger.info("curl_cffi 后端: 退出时无需关闭浏览器")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -623,6 +644,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=PAGE_SLEEP,
         help="页间间隔秒数",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["drission", "curl_cffi"],
+        default="drission",
+        help="抓取后端；长线分支支持 --backend curl_cffi 跳过浏览器启动（仍需 Cloudflare clearance）。",
     )
     args = parser.parse_args(argv)
     if args.start_page < 1:
