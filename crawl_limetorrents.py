@@ -54,9 +54,9 @@ BROWSE_CATEGORIES = {
 
 def normalize_category(value: str, allow_all: bool = False) -> str:
     # 站点在 Related 单元格偶尔会写 "Anime." / "Movies ;" 等带末尾标点的别名,
-    # 先 collapse 空白再 trim 标点,避免 "Anime ;" 中标点前留有空格导致 trim 失败。
+    # 先 collapse 空白 → trim 标点 → 再 strip 残余空白,确保查表时 key 严格匹配 BROWSE_CATEGORIES。
     cleaned = re.sub(r"\s+", " ", value.strip())
-    cleaned = re.sub(r"[.,;:!\?\"]+$", "", cleaned).lower()
+    cleaned = re.sub(r"[.,;:!\?\"]+$", "", cleaned).strip().lower()
     if allow_all and cleaned == "all":
         return "all"
     try:
