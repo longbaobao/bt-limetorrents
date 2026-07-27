@@ -74,6 +74,41 @@ def test_curl_cffi_backend_propagates_5xx(monkeypatch):
         backend.fetch("https://example.com/")
 
 
+def test_curl_cffi_backend_retries_transient_sslerror(monkeypatch):
+    """Windows 上 curl_cffi 偶发 OpenSSL 错误, 后端要重试而不直接抛。"""
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("OPENSSL_internal:invalid library")
+        return FakeResponse("<html>ok</html>")
+
+    fake_session = type("S", (), {"get": flaky})()
+    fake_module = type("F", (), {"requests": fake_session})()
+    monkeypatch.setitem(sys.modules, "curl_cffi", fake_module)
+    backend = request_client.CurlCffiBackend(max_attempts=3)
+    body = backend.fetch("https://example.com/")
+    assert body == "<html>ok</html>"
+    assert calls["n"] == 3
+
+
+def test_curl_cffi_backend_eventually_raises(monkeypatch):
+    calls = {"n": 0}
+
+    def always_fail(*args, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("OPENSSL_internal:invalid library")
+
+    fake_session = type("S", (), {"get": always_fail})()
+    fake_module = type("F", (), {"requests": fake_session})()
+    monkeypatch.setitem(sys.modules, "curl_cffi", fake_module)
+    backend = request_client.CurlCffiBackend(max_attempts=3)
+    with pytest.raises(RuntimeError, match="经 3 次重试仍失败"):
+        backend.fetch("https://example.com/")
+    assert calls["n"] == 3
+
+
 def test_build_backend_curl_cffi_does_not_need_browser():
     backend = request_client.build_backend("curl_cffi")
     assert isinstance(backend, request_client.CurlCffiBackend)
