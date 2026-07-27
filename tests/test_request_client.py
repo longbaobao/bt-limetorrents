@@ -62,8 +62,10 @@ def test_curl_cffi_backend_uses_impersonate_and_returns_text(monkeypatch):
 
 def test_curl_cffi_backend_propagates_5xx(monkeypatch):
     fake = FakeSession()
-    def boom(**kw):
+
+    def boom(*args, **kwargs):
         return FakeResponse(status_code=503)
+
     fake.get = boom
     fake_module = type("F", (), {"requests": type("R", (), {"get": fake.get})()})()
     monkeypatch.setitem(sys.modules, "curl_cffi", fake_module)
