@@ -197,12 +197,25 @@ def upsert_listing(coll, item: dict) -> bool:
       状态字段(避免覆盖已 processing/done/failed 的记录)。
     - $addToSet 累积 keywords 和 discovery_modes(同一 detail 可能被多 key/多 mode 发现)。
 
+    注意：`keywords` 字段同一 update 中只能被一个 operator 操作。
+    - 优先用 $addToSet(累积关键词)。
+    - 仅当本次不提供 keyword(related 路径)时,在 $setOnInsert 中初始化为空数组,
+      否则 $set 不会触碰 keywords,避免与 $addToSet 冲突。
+    - 调用方传入 item['keywords'] 会被丢弃(本函数不直接信 caller 的 keywords),
+      统一从 item.get('keyword') 单数源派生。
+
     返回 True 表示本次为 insert, False 表示命中已有记录。
     """
     stored = {
         key: value
         for key, value in item.items()
-        if key not in {"keyword", "discovery_mode", "observed_at"}
+        if key
+        not in {
+            "keyword",
+            "keywords",
+            "discovery_mode",
+            "observed_at",
+        }
     }
     stored["last_seen_at"] = item["observed_at"]
     set_on_insert = {
@@ -218,15 +231,12 @@ def upsert_listing(coll, item: dict) -> bool:
     else:
         set_on_insert["keywords"] = []
 
-    result = coll.update_one(
-        {"_id": item["_id"]},
-        {
-            "$set": stored,
-            "$setOnInsert": set_on_insert,
-            "$addToSet": add_to_set,
-        },
-        upsert=True,
-    )
+    update = {
+        "$set": stored,
+        "$setOnInsert": set_on_insert,
+        "$addToSet": add_to_set,
+    }
+    result = coll.update_one({"_id": item["_id"]}, update, upsert=True)
     return result.upserted_id is not None
 
 
