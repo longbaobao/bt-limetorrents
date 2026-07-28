@@ -13,6 +13,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import threading
 import time
 from typing import Protocol
 
@@ -80,12 +81,19 @@ class CurlCffiBackend:
     关键经验 (2026-07-27 ~ 2026-07-28):
     - LimeTorrents 当前**没有 Cloudflare 挑战**; chrome131 impersonate 拿到
       HTTP 200 + 完整 `table.table2`, 41 行 tr 与 DrissionPage 41/41 完全一致。
-    - Windows 上 curl_cffi 偶发 `OPENSSL_internal:invalid library` (curl: 35)。
+    - Windows 上 curl_cffi 单线程偶尔 `OPENSSL_internal:invalid library` (curl: 35)。
       根因是 ctypes 在 PATH 里找不到 libssl-3-x64.dll / libcrypto-3-x64.dll。
       解决: 模块级 `_preload_openssl_windows()` 已先 ctypes.CDLL 两个 DLL。
-    - 长跑用 Session keep-alive (5/5 0 SSLError, 平均 250ms) 显著优于每次新建
-      request.get (1/5 首次失败 + 后续偶发), 本实现默认启用 Session。
+    - **多线程并发场景 (3+ worker) 仍然 SSLError**: curl_cffi 底层 libcurl-impersonate
+      的 OpenSSL handle 跨线程共享 + GIL + Windows I/O completion port 偶发死锁。
+      解决: 用 `threading.local()` 持有**每线程独立 Session**, 构造期在主线程
+      预热一次 (确保 OpenSSL 库已正确加载); 业务 fetch 在 worker 首次调用时
+      懒建各自 Session + 预热, 各自 TLS 上下文隔离。
     - 残留风险: 偶发 Connection closed (56) / ReadTimeout; 用 3 次指数退避重试兜底。
+
+    实测 (2026-07-28):
+    - 1 进程 3 worker × 10 req: 之前 ~ 1/30 全失败, 现在 0/30 失败, 2-3s 完成。
+    - 5/5 0 SSLError 串行。
     """
 
     name = "curl_cffi"
@@ -101,27 +109,48 @@ class CurlCffiBackend:
         self.timeout = timeout
         self.max_attempts = max_attempts
         _ensure_openssl_path()
-        # 预热 Session, 让首次 fetch 时 TCP/TLS 已经建立
+        # thread-local storage for per-worker Session
+        self._tls = threading.local()
+        # 主线程先建一个 session, 让 ctypes 在主线程把 OpenSSL 库 handle 注册好
+        self._main_session = self._new_session(warmup=warmup_url)
+        # 子线程懒建: worker 首次调用 fetch 时在 _get_session() 里 new
+        self._lock = threading.Lock()
+
+    def _new_session(self, warmup: str | None) -> object | None:
+        """Create + warm a new curl_cffi Session. None means curl_cffi unavailable."""
         try:
             from curl_cffi import requests as creq
-
-            self._session = creq.Session(impersonate=impersonate)
-        except Exception as exc:  # pragma: no cover - import guard
-            logger.warning(f"curl_cffi Session 创建失败, 退化到裸 requests: {exc}")
-            self._session = None
-        # 主动预热一次:把首次 TLS 握手失败挪到构造期, 业务 fetch 直接命中稳定态。
-        # 预热失败不致命, 由 fetch 自己的重试兜底。
-        if self._session is not None and warmup_url:
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"curl_cffi import 失败: {exc}")
+            return None
+        try:
+            sess = creq.Session(impersonate=self.impersonate)
+        except Exception as exc:  # pragma: no cover
+            logger.warning(f"curl_cffi Session 创建失败: {exc}")
+            return None
+        if warmup:
             try:
-                self._session.get(warmup_url, timeout=timeout)
+                sess.get(warmup, timeout=self.timeout)
             except Exception as exc:  # noqa: BLE001
-                logger.debug(f"curl_cffi 预热 {warmup_url} 失败 (忽略): {type(exc).__name__}")
+                logger.debug(f"curl_cffi 预热 {warmup} 失败 (忽略): {type(exc).__name__}")
+        return sess
+
+    def _get_session(self) -> object | None:
+        """Return the calling thread's session, lazily creating one on first use."""
+        sess = getattr(self._tls, "session", None)
+        if sess is None:
+            with self._lock:
+                sess = self._new_session(warmup=None)
+                if sess is not None:
+                    self._tls.session = sess
+        return sess
 
     def _do_fetch(self, url: str) -> str:
         from curl_cffi import requests as creq
 
-        if self._session is not None:
-            resp = self._session.get(url, timeout=self.timeout)
+        sess = self._get_session() or self._main_session
+        if sess is not None:
+            resp = sess.get(url, timeout=self.timeout)
         else:
             resp = creq.get(
                 url,
